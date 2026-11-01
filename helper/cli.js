@@ -2,8 +2,11 @@
 // Local helper (runs on each builder laptop).
 //
 //   node helper/cli.js enroll <coordinator-url> <device-id>   (then put the token in $TEAM_AGENT_HOME/token)
-//   node helper/cli.js checkpoint --task TASK-1 --run RUN-1 --status Building \
-//        --summary "..." [--verification "..."] [--next "..."] [--generation 1]
+//   node helper/cli.js claim TASK-1                  (exclusive lease; needs the coordinator)
+//   node helper/cli.js heartbeat TASK-1              (keeps the lease alive; stops if the claim is lost)
+//   node helper/cli.js checkpoint --task TASK-1 --status Building --summary "..." \
+//        [--verification "..."] [--next "..."]       (uses the run and generation from the claim)
+//   node helper/cli.js release TASK-1
 //   node helper/cli.js flush
 //   node helper/cli.js status
 //
@@ -17,6 +20,7 @@ import { parseArgs } from 'node:util';
 import { Outbox } from './outbox.js';
 import { flush } from './sender.js';
 import { validateEvent } from '../shared/event.js';
+import { ClaimFile, claimTask, heartbeat, newRunId, releaseClaim } from './claims.js';
 
 const home = process.env.TEAM_AGENT_HOME ?? join(homedir(), '.team-agent');
 const configPath = join(home, 'config.json');
@@ -36,6 +40,7 @@ function loadConfig() {
   return { ...config, token };
 }
 
+const claimFile = new ClaimFile(home);
 const [cmd, ...rest] = process.argv.slice(2);
 
 if (cmd === 'enroll') {
@@ -48,28 +53,95 @@ if (cmd === 'enroll') {
   writeFileSync(configPath, JSON.stringify({ coordinator_url: url, device_id: deviceId }, null, 2));
   console.log(`saved ${configPath}. Now save the device token (from the coordinator's device-add) to ${tokenPath}:`);
   console.log(`  umask 077 && pbpaste > "${tokenPath}"   # macOS: copy the token first`);
+} else if (cmd === 'claim') {
+  const taskId = rest[0];
+  if (!taskId) {
+    console.error('usage: claim <TASK-1>');
+    process.exit(2);
+  }
+  const cfg = loadConfig();
+  const existing = claimFile.get(taskId);
+  const runId = existing?.run_id ?? newRunId();
+  const r = await claimTask({ url: cfg.coordinator_url, deviceId: cfg.device_id, token: cfg.token }, taskId, runId);
+  if (r.ok) {
+    claimFile.set(taskId, { run_id: runId, generation: r.data.generation, expires_at: r.data.expires_at });
+    console.log(`claimed ${taskId}: run ${runId}, generation ${r.data.generation}, lease ${Math.round(r.data.lease_ms / 1000)}s`);
+    console.log('keep it alive with: node helper/cli.js heartbeat ' + taskId);
+  } else {
+    console.error(`not claimed: ${r.data.error ?? r.status}${r.data.owner ? ` (held by ${r.data.owner})` : ''}`);
+    process.exit(1);
+  }
+} else if (cmd === 'heartbeat') {
+  const taskId = rest[0];
+  const claim = taskId && claimFile.get(taskId);
+  if (!claim) {
+    console.error('no local claim for that task; run: claim <TASK-1>');
+    process.exit(2);
+  }
+  const cfg = loadConfig();
+  const ac = new AbortController();
+  process.on('SIGINT', () => ac.abort());
+  console.log(`heartbeat for ${taskId} (generation ${claim.generation}); Ctrl+C to stop`);
+  const intervalMs = Number(process.env.TEAM_AGENT_HEARTBEAT_MS ?? 30_000);
+  const out = await heartbeat({ url: cfg.coordinator_url, deviceId: cfg.device_id, token: cfg.token }, taskId, claim, {
+    intervalMs, signal: ac.signal, log: console.log,
+  });
+  if (out.stopped === 'aborted') console.log('stopped; the lease will expire on its own');
+  else {
+    console.error(`CLAIM LOST (${out.reason}). Stop work on ${taskId}: further output will be rejected.`);
+    claimFile.remove(taskId);
+    process.exit(3);
+  }
+} else if (cmd === 'release') {
+  const taskId = rest[0];
+  const claim = taskId && claimFile.get(taskId);
+  if (!claim) {
+    console.error('no local claim for that task');
+    process.exit(2);
+  }
+  const cfg = loadConfig();
+  // Deliver any queued checkpoints first: once released we still hold the generation, but be tidy.
+  const outbox = new Outbox(join(home, 'outbox.db'));
+  await flush({ outbox, url: cfg.coordinator_url, deviceId: cfg.device_id, token: cfg.token, log: console.error });
+  const left = outbox.counts().pending ?? 0;
+  outbox.close();
+  if (left) {
+    console.error(`${left} checkpoint(s) are still queued; not releasing. Flush them first.`);
+    process.exit(1);
+  }
+  const r = await releaseClaim({ url: cfg.coordinator_url, deviceId: cfg.device_id, token: cfg.token }, taskId, claim.run_id, claim.generation);
+  if (r.ok) {
+    claimFile.remove(taskId);
+    console.log(`released ${taskId}`);
+  } else {
+    console.error(`not released: ${r.data.error ?? r.status}`);
+    process.exit(1);
+  }
 } else if (cmd === 'checkpoint') {
   const { values: v } = parseArgs({
     args: rest,
     options: {
       task: { type: 'string' },
-      run: { type: 'string', default: 'RUN-1' },
       status: { type: 'string', default: 'Building' },
       summary: { type: 'string' },
       verification: { type: 'string', default: '' },
       next: { type: 'string', default: '' },
-      generation: { type: 'string', default: '0' },
     },
   });
+  const claim = v.task && claimFile.get(v.task);
+  if (!claim) {
+    console.error(`no local claim for ${v.task}; claim it first: node helper/cli.js claim ${v.task ?? '<TASK-1>'}`);
+    process.exit(2);
+  }
   const cfg = loadConfig();
   const head = git('rev-parse', 'HEAD');
   const unpushed = git('rev-list', '--count', '@{u}..HEAD');
   const event = {
     event_id: randomUUID(),
     task_id: v.task,
-    run_id: v.run,
+    run_id: claim.run_id,
     device_id: cfg.device_id,
-    claim_generation: Number(v.generation),
+    claim_generation: claim.generation,
     type: 'checkpoint',
     source_commit: head,
     unpushed_commits: unpushed === null ? null : Number(unpushed),

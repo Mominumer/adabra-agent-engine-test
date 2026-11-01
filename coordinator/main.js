@@ -6,6 +6,8 @@
 //   node coordinator/main.js device-rotate <device-id>   (new token; the old one stops working)
 //   node coordinator/main.js device-revoke <device-id>
 //   node coordinator/main.js task-add <TASK-1> <issue-number>
+//   node coordinator/main.js claims                       (who holds which task)
+//   node coordinator/main.js claim-cancel <TASK-1>        (operator: fence the current owner)
 //   node coordinator/main.js status
 //
 // Environment:
@@ -39,6 +41,18 @@ if (cmd === 'device-add' && args[0]) {
 } else if (cmd === 'task-add' && args[0] && Number.isInteger(Number(args[1]))) {
   store.addTask(args[0], Number(args[1]));
   console.log(`${args[0]} -> issue #${args[1]}`);
+} else if (cmd === 'claim-cancel' && args[0]) {
+  const r = store.cancelClaim(args[0]);
+  console.log(r.ok ? `cancelled ${args[0]}; generation is now ${r.generation}, the old owner's output is fenced` : `failed: ${r.reason}`);
+} else if (cmd === 'claims') {
+  for (const t of store.db.prepare('SELECT task_id, generation FROM tasks ORDER BY task_id').all()) {
+    const c = store.currentClaim(t.task_id);
+    console.log(
+      c
+        ? `${t.task_id} gen ${t.generation}: ${c.state} by ${c.device_id} run ${c.run_id}, lease ${c.expires_at > Date.now() ? 'valid' : 'expired'}`
+        : `${t.task_id} gen ${t.generation}: unclaimed`,
+    );
+  }
 } else if (cmd === 'status') {
   console.log(store.counts());
 } else if (cmd === 'serve') {
@@ -58,7 +72,8 @@ if (cmd === 'device-add' && args[0]) {
   worker.start();
   const host = process.env.COORDINATOR_HOST ?? '127.0.0.1';
   const port = Number(process.env.COORDINATOR_PORT ?? 8787);
-  createServer({ store, log }).listen(port, host, () => log(`coordinator listening on ${host}:${port}`));
+  const leaseMs = Number(process.env.COORDINATOR_LEASE_MS ?? 180_000);
+  createServer({ store, log, leaseMs }).listen(port, host, () => log(`coordinator listening on ${host}:${port}`));
 } else {
   usage();
 }

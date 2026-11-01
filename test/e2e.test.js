@@ -54,20 +54,24 @@ const listen = (server, port = 0) =>
   new Promise((r) => server.listen(port, '127.0.0.1', () => r(server.address().port)));
 const close = (server) => new Promise((r) => (server.closeAllConnections?.(), server.close(r)));
 
-async function setup() {
+const LEASE = 60_000;
+
+async function setup({ preclaim = true } = {}) {
+  const clock = { t: Date.now() };
   const dir = mkdtempSync(join(tmpdir(), 'adabra-'));
   const gh = fakeGitHub();
   const ghPort = await gh.listen();
   const store = new Store(join(dir, 'coord.db'));
   const token = store.addDevice('member-a');
   store.addTask('TASK-1', 1);
+  if (preclaim) store.claimTask('TASK-1', 'member-a', 'RUN-1', clock.t, LEASE); // generation 1
   const github = new GitHubClient({ apiUrl: `http://127.0.0.1:${ghPort}`, repo: 'o/r', token: 'gh-test-token', timeoutMs: 2000 });
   const worker = new Worker({ store, github });
-  const server = createServer({ store });
+  const server = createServer({ store, now: () => clock.t, leaseMs: LEASE });
   const port = await listen(server);
   const outbox = new Outbox(join(dir, 'outbox.db'));
   const ctx = {
-    dir, gh, store, worker, server, port, outbox, token,
+    dir, gh, store, worker, server, port, outbox, token, clock,
     url: `http://127.0.0.1:${port}`,
     send: (opts = {}) => flush({ outbox, url: ctx.url, deviceId: 'member-a', token, ...opts }),
     async teardown() {
@@ -235,7 +239,7 @@ test('coordinator unreachable: event stays in the outbox and is delivered later'
     assert.equal(t.outbox.counts().pending, 1);
 
     // back up on the same port, later than the backoff window
-    t.server = createServer({ store: t.store });
+    t.server = createServer({ store: t.store, now: () => t.clock.t, leaseMs: LEASE });
     await listen(t.server, t.port);
     const r2 = await t.send({ now: Date.now() + 10_000 });
     assert.equal(r2.acked, 1);
@@ -287,6 +291,164 @@ test('later checkpoints edit the same comment; an older event never regresses it
     assert.equal(t.gh.comments.length, 1);
     assert.match(t.gh.comments[0].body, /second/);
     assert.doesNotMatch(t.gh.comments[0].body, /stale/);
+  } finally {
+    await t.teardown();
+  }
+});
+
+// --- claims -----------------------------------------------------------------
+const api = (t, device, token, path, body) =>
+  fetch(`${t.url}${path}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-device-id': device, authorization: `Bearer ${token}` },
+    body: JSON.stringify(body),
+  }).then(async (r) => ({ status: r.status, data: await r.json() }));
+
+async function claimSetup() {
+  const t = await setup({ preclaim: false });
+  t.tokenB = t.store.addDevice('member-b');
+  return t;
+}
+
+test('two devices race for one task: exactly one wins', async () => {
+  const t = await claimSetup();
+  try {
+    const [a, b] = await Promise.all([
+      api(t, 'member-a', t.token, '/v1/claims', { task_id: 'TASK-1', run_id: 'RUN-A' }),
+      api(t, 'member-b', t.tokenB, '/v1/claims', { task_id: 'TASK-1', run_id: 'RUN-B' }),
+    ]);
+    assert.deepEqual([a.status, b.status].sort(), [200, 409]);
+    const loser = a.status === 409 ? a : b;
+    assert.equal(loser.data.error, 'claimed');
+    assert.equal(t.store.getTask('TASK-1').generation, 1);
+  } finally {
+    await t.teardown();
+  }
+});
+
+test('asking again as the same owner is idempotent (same generation)', async () => {
+  const t = await claimSetup();
+  try {
+    const first = await api(t, 'member-a', t.token, '/v1/claims', { task_id: 'TASK-1', run_id: 'RUN-A' });
+    const again = await api(t, 'member-a', t.token, '/v1/claims', { task_id: 'TASK-1', run_id: 'RUN-A' });
+    assert.equal(again.status, 200);
+    assert.equal(again.data.generation, first.data.generation);
+  } finally {
+    await t.teardown();
+  }
+});
+
+test('events need the current claim: none, wrong run, and wrong device are all fenced', async () => {
+  const t = await claimSetup();
+  try {
+    const ev = (over) => makeEvent({ claim_generation: 1, run_id: 'RUN-A', ...over });
+    const send = (e, dev = 'member-a', tok = t.token) => api(t, dev, tok, '/v1/events', e);
+    assert.equal((await send(ev())).status, 409); // nobody holds the task yet
+    await api(t, 'member-a', t.token, '/v1/claims', { task_id: 'TASK-1', run_id: 'RUN-A' });
+    assert.equal((await send(ev({ run_id: 'RUN-OTHER' }))).status, 409);
+    assert.equal((await send(ev({ claim_generation: 2 }))).status, 409);
+    assert.equal((await send(ev({ device_id: 'member-b' }), 'member-b', t.tokenB)).status, 409);
+    assert.equal((await send(ev())).status, 200);
+    assert.equal(t.store.db.prepare('SELECT COUNT(*) n FROM events').get().n, 1);
+  } finally {
+    await t.teardown();
+  }
+});
+
+test('renewal extends the lease and blocks takeover until it lapses', async () => {
+  const t = await claimSetup();
+  try {
+    await api(t, 'member-a', t.token, '/v1/claims', { task_id: 'TASK-1', run_id: 'RUN-A' });
+    t.clock.t += LEASE - 1000;
+    const renewed = await api(t, 'member-a', t.token, '/v1/claims/renew', { task_id: 'TASK-1', run_id: 'RUN-A', generation: 1 });
+    assert.equal(renewed.status, 200);
+    t.clock.t += LEASE - 1000; // past the ORIGINAL expiry, inside the renewed lease
+    const early = await api(t, 'member-b', t.tokenB, '/v1/claims', { task_id: 'TASK-1', run_id: 'RUN-B' });
+    assert.equal(early.status, 409);
+  } finally {
+    await t.teardown();
+  }
+});
+
+test('expired lease: another device takes over, and the old owner is fenced everywhere', async () => {
+  const t = await claimSetup();
+  try {
+    await api(t, 'member-a', t.token, '/v1/claims', { task_id: 'TASK-1', run_id: 'RUN-A' });
+    t.clock.t += LEASE + 1;
+    const takeover = await api(t, 'member-b', t.tokenB, '/v1/claims', { task_id: 'TASK-1', run_id: 'RUN-B' });
+    assert.equal(takeover.status, 200);
+    assert.equal(takeover.data.generation, 2);
+
+    // the old owner comes back from sleep with generation 1
+    const staleEvent = await api(t, 'member-a', t.token, '/v1/events', makeEvent({ claim_generation: 1, run_id: 'RUN-A' }));
+    assert.equal(staleEvent.status, 409);
+    const staleRenew = await api(t, 'member-a', t.token, '/v1/claims/renew', { task_id: 'TASK-1', run_id: 'RUN-A', generation: 1 });
+    assert.equal(staleRenew.status, 409);
+    assert.equal(staleRenew.data.error, 'superseded');
+    const staleRelease = await api(t, 'member-a', t.token, '/v1/claims/release', { task_id: 'TASK-1', run_id: 'RUN-A', generation: 1 });
+    assert.equal(staleRelease.status, 409);
+
+    const fresh = await api(t, 'member-b', t.tokenB, '/v1/events', makeEvent({ device_id: 'member-b', claim_generation: 2, run_id: 'RUN-B' }));
+    assert.equal(fresh.status, 200);
+  } finally {
+    await t.teardown();
+  }
+});
+
+test('an expired lease cannot be renewed; the owner must claim again (new generation)', async () => {
+  const t = await claimSetup();
+  try {
+    await api(t, 'member-a', t.token, '/v1/claims', { task_id: 'TASK-1', run_id: 'RUN-A' });
+    t.clock.t += LEASE + 1;
+    const renew = await api(t, 'member-a', t.token, '/v1/claims/renew', { task_id: 'TASK-1', run_id: 'RUN-A', generation: 1 });
+    assert.equal(renew.status, 409);
+    assert.equal(renew.data.error, 'expired');
+    const reclaim = await api(t, 'member-a', t.token, '/v1/claims', { task_id: 'TASK-1', run_id: 'RUN-A' });
+    assert.equal(reclaim.data.generation, 2);
+  } finally {
+    await t.teardown();
+  }
+});
+
+test('release frees the task for someone else and fences the releasing owner', async () => {
+  const t = await claimSetup();
+  try {
+    await api(t, 'member-a', t.token, '/v1/claims', { task_id: 'TASK-1', run_id: 'RUN-A' });
+    const rel = await api(t, 'member-a', t.token, '/v1/claims/release', { task_id: 'TASK-1', run_id: 'RUN-A', generation: 1 });
+    assert.equal(rel.status, 200);
+    const b = await api(t, 'member-b', t.tokenB, '/v1/claims', { task_id: 'TASK-1', run_id: 'RUN-B' });
+    assert.equal(b.status, 200);
+    assert.equal(b.data.generation, 2);
+    const old = await api(t, 'member-a', t.token, '/v1/events', makeEvent({ claim_generation: 1, run_id: 'RUN-A' }));
+    assert.equal(old.status, 409);
+  } finally {
+    await t.teardown();
+  }
+});
+
+test('operator cancel fences the current owner immediately', async () => {
+  const t = await claimSetup();
+  try {
+    await api(t, 'member-a', t.token, '/v1/claims', { task_id: 'TASK-1', run_id: 'RUN-A' });
+    t.store.cancelClaim('TASK-1');
+    const ev = await api(t, 'member-a', t.token, '/v1/events', makeEvent({ claim_generation: 1, run_id: 'RUN-A' }));
+    assert.equal(ev.status, 409);
+    const renew = await api(t, 'member-a', t.token, '/v1/claims/renew', { task_id: 'TASK-1', run_id: 'RUN-A', generation: 1 });
+    assert.equal(renew.status, 409);
+    const b = await api(t, 'member-b', t.tokenB, '/v1/claims', { task_id: 'TASK-1', run_id: 'RUN-B' });
+    assert.equal(b.data.generation, 3);
+  } finally {
+    await t.teardown();
+  }
+});
+
+test('claim requests: unknown task, bad body and bad credentials are refused', async () => {
+  const t = await claimSetup();
+  try {
+    assert.equal((await api(t, 'member-a', t.token, '/v1/claims', { task_id: 'TASK-99', run_id: 'RUN-A' })).status, 422);
+    assert.equal((await api(t, 'member-a', t.token, '/v1/claims', { task_id: 'nope', run_id: 'RUN-A' })).status, 400);
+    assert.equal((await api(t, 'member-a', t.token, '/v1/claims/renew', { task_id: 'TASK-1', run_id: 'RUN-A' })).status, 400);
+    assert.equal((await api(t, 'member-a', 'wrong', '/v1/claims', { task_id: 'TASK-1', run_id: 'RUN-A' })).status, 401);
   } finally {
     await t.teardown();
   }
