@@ -1,0 +1,8 @@
+node_modules/
+*.db
+*.db-wal
+*.db-shm
+token
+*token*
+.env
+.DS_Store

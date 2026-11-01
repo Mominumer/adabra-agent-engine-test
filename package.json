@@ -1,0 +1,13 @@
+{
+  "name": "adabra-agent-engine-test",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "description": "Milestone 2 test: helper outbox -> coordinator -> GitHub issue comment",
+  "engines": { "node": ">=22.13" },
+  "scripts": {
+    "test": "node --test test/",
+    "coordinator": "node coordinator/main.js",
+    "agent": "node helper/cli.js"
+  }
+}
