@@ -55,7 +55,10 @@ case "${1:-}" in
 PLIST_EOF
     chmod 600 "$PLIST"
     launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true
-    launchctl bootstrap "$DOMAIN" "$PLIST"
+    # bootout returns before the old service is gone; bootstrapping too early fails and leaves nothing loaded
+    for _ in $(seq 1 20); do launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1 || break; sleep 0.5; done
+    for _ in 1 2 3 4 5; do launchctl bootstrap "$DOMAIN" "$PLIST" 2>/dev/null && break; sleep 1; done
+    launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1 || { echo "could not load $LABEL (see: launchctl bootstrap $DOMAIN $PLIST)"; exit 1; }
     launchctl kickstart -k "$DOMAIN/$LABEL"
     sleep 2
     "$0" status
