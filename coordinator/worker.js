@@ -54,13 +54,22 @@ export class Worker {
 
     const body = renderComment(event);
     let commentId = task.comment_id;
+    if (commentId) {
+      try {
+        await this.github.updateComment(commentId, body);
+      } catch (err) {
+        // The remembered comment is gone (deleted, or an id from another repo). Look it up again.
+        if (err.status !== 404) throw err;
+        this.log(`comment ${commentId} for ${event.task_id} not found; looking it up again`);
+        this.store.setTaskComment(event.task_id, null);
+        commentId = null;
+      }
+    }
     if (!commentId) {
       commentId = await this.github.findProgressComment(task.issue_number, event.task_id);
       if (!commentId) commentId = await this.github.createComment(task.issue_number, body);
       else await this.github.updateComment(commentId, body);
       this.store.setTaskComment(event.task_id, commentId);
-    } else {
-      await this.github.updateComment(commentId, body);
     }
     this.store.setTaskApplied(event.task_id, event.ts);
     this.store.markDone(event.event_id);

@@ -52,6 +52,16 @@ export class Store {
     return token; // shown once, never stored in clear
   }
 
+  // Issue a new token for an existing device (lost or mis-copied token); the old one stops working.
+  rotateDevice(deviceId) {
+    const token = randomBytes(32).toString('hex');
+    const r = this.db
+      .prepare('UPDATE devices SET token_hash = ?, revoked = 0 WHERE device_id = ?')
+      .run(sha256(token), deviceId);
+    if (r.changes === 0) throw new Error(`unknown device ${deviceId}`);
+    return token;
+  }
+
   revokeDevice(deviceId) {
     this.db.prepare('UPDATE devices SET revoked = 1 WHERE device_id = ?').run(deviceId);
   }

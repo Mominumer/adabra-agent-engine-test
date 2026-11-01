@@ -35,6 +35,7 @@ function fakeGitHub() {
       }
       if ((m = req.url.match(/^\/repos\/o\/r\/issues\/comments\/(\d+)$/)) && req.method === 'PATCH') {
         const c = comments.find((x) => x.id === +m[1]);
+        if (!c) return json(404, { message: 'Not Found' });
         c.body = JSON.parse(raw).body;
         return json(200, c);
       }
@@ -166,6 +167,39 @@ test('unknown device and wrong token are refused; nothing is stored', async () =
     t.store.revokeDevice('member-a');
     assert.equal((await post({ 'x-device-id': 'member-a', authorization: `Bearer ${t.token}` })).status, 401);
     assert.equal(t.store.db.prepare('SELECT COUNT(*) n FROM events').get().n, 0);
+  } finally {
+    await t.teardown();
+  }
+});
+
+test('rotating a device token invalidates the old one and the new one works', async () => {
+  const t = await setup();
+  try {
+    const post = (token) =>
+      fetch(`${t.url}/v1/events`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-device-id': 'member-a', authorization: `Bearer ${token}` },
+        body: JSON.stringify(makeEvent()),
+      });
+    const fresh = t.store.rotateDevice('member-a');
+    assert.equal((await post(t.token)).status, 401);
+    assert.equal((await post(fresh)).status, 200);
+    assert.throws(() => t.store.rotateDevice('nobody'), /unknown device/);
+  } finally {
+    await t.teardown();
+  }
+});
+
+test('a remembered comment id that no longer exists is recovered, not retried forever', async () => {
+  const t = await setup();
+  try {
+    t.store.setTaskComment('TASK-1', 1001); // stale id GitHub has never heard of
+    t.outbox.add(makeEvent());
+    await t.send();
+    await t.worker.tick();
+    assert.equal(t.gh.comments.length, 1);
+    assert.equal(t.store.counts().done, 1);
+    assert.notEqual(t.store.getTask('TASK-1').comment_id, 1001);
   } finally {
     await t.teardown();
   }

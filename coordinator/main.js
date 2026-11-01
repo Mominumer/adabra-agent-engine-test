@@ -3,6 +3,7 @@
 //
 //   node coordinator/main.js serve
 //   node coordinator/main.js device-add <device-id>      (prints the token once)
+//   node coordinator/main.js device-rotate <device-id>   (new token; the old one stops working)
 //   node coordinator/main.js device-revoke <device-id>
 //   node coordinator/main.js task-add <TASK-1> <issue-number>
 //   node coordinator/main.js status
@@ -30,6 +31,8 @@ function usage() {
 
 if (cmd === 'device-add' && args[0]) {
   console.log(`device ${args[0]} token (shown once, store it on that device only):\n${store.addDevice(args[0])}`);
+} else if (cmd === 'device-rotate' && args[0]) {
+  console.log(`device ${args[0]} new token (shown once; the old token no longer works):\n${store.rotateDevice(args[0])}`);
 } else if (cmd === 'device-revoke' && args[0]) {
   store.revokeDevice(args[0]);
   console.log(`revoked ${args[0]}`);
