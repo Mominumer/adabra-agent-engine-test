@@ -40,6 +40,18 @@ tailscale serve --bg 8787
 
 The coordinator listens on 127.0.0.1 only; `tailscale serve` is the only way in.
 
+## Run the coordinator as a service (Mac mini)
+
+```bash
+service/coordinator-service.sh install     # LaunchAgent: starts at login, restarts after a crash
+service/coordinator-service.sh status
+service/coordinator-service.sh logs        # ~/Library/Logs/adabra-coordinator.log
+service/coordinator-service.sh uninstall
+```
+
+Stop any coordinator running in a Terminal window first (port 8787). The mini must log in automatically after a reboot
+(System Settings > Users & Groups > Automatic login), because a LaunchAgent runs in the user's session.
+
 ## Run on a laptop (helper)
 
 ```bash

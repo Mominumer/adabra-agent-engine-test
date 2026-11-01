@@ -160,7 +160,13 @@ if (cmd === 'enroll') {
   outbox.add(event); // durable first
   console.log(`recorded ${event.event_id}`);
   const r = await flush({ outbox, url: cfg.coordinator_url, deviceId: cfg.device_id, token: cfg.token, log: console.error });
-  console.log(r.acked ? 'acknowledged by the coordinator' : 'queued; will retry on the next flush');
+  console.log(
+    r.acked
+      ? 'acknowledged by the coordinator'
+      : r.rejected
+        ? 'REJECTED by the coordinator (not retried): you may no longer hold this task; see the reason above'
+        : 'queued; will retry on the next flush',
+  );
   outbox.close();
 } else if (cmd === 'flush') {
   const cfg = loadConfig();
