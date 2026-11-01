@@ -1,4 +1,4 @@
-import { chmodSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 
@@ -13,21 +13,31 @@ export class ClaimFile {
     return existsSync(this.path) ? JSON.parse(readFileSync(this.path, 'utf8')) : {};
   }
 
+  all() {
+    return this.#read();
+  }
+
   get(taskId) {
     return this.#read()[taskId] ?? null;
+  }
+
+  // Written to a temp file and renamed so the background agent and the CLI never see a half-written file.
+  #write(all) {
+    const tmp = `${this.path}.${process.pid}.tmp`;
+    writeFileSync(tmp, JSON.stringify(all, null, 2), { mode: 0o600 });
+    renameSync(tmp, this.path);
   }
 
   set(taskId, claim) {
     const all = this.#read();
     all[taskId] = claim;
-    writeFileSync(this.path, JSON.stringify(all, null, 2), { mode: 0o600 });
-    chmodSync(this.path, 0o600);
+    this.#write(all);
   }
 
   remove(taskId) {
     const all = this.#read();
     delete all[taskId];
-    writeFileSync(this.path, JSON.stringify(all, null, 2), { mode: 0o600 });
+    this.#write(all);
   }
 }
 

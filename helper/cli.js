@@ -175,8 +175,16 @@ if (cmd === 'enroll') {
   outbox.close();
 } else if (cmd === 'status') {
   const outbox = new Outbox(join(home, 'outbox.db'));
-  console.log(outbox.counts());
+  console.log('outbox:', outbox.counts());
   outbox.close();
+  console.log('claims held:', Object.keys(claimFile.all()).join(', ') || 'none');
+  try {
+    const a = JSON.parse(readFileSync(join(home, 'agent-status.json'), 'utf8'));
+    const age = Math.round((Date.now() - Date.parse(a.at)) / 1000);
+    console.log(`background agent: last pass ${age}s ago${age > 120 ? ' (NOT RUNNING? it should report every 30s)' : ''}`);
+  } catch {
+    console.log('background agent: no status file (not running)');
+  }
 } else {
   console.error('usage: cli.js enroll | checkpoint | flush | status');
   process.exit(2);

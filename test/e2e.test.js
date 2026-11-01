@@ -11,6 +11,8 @@ import { Worker } from '../coordinator/worker.js';
 import { GitHubClient } from '../coordinator/github.js';
 import { Outbox } from '../helper/outbox.js';
 import { flush } from '../helper/sender.js';
+import { ClaimFile } from '../helper/claims.js';
+import { tick } from '../helper/tick.js';
 
 // --- fake GitHub: issue comments only ---------------------------------------
 function fakeGitHub() {
@@ -449,6 +451,87 @@ test('claim requests: unknown task, bad body and bad credentials are refused', a
     assert.equal((await api(t, 'member-a', t.token, '/v1/claims', { task_id: 'nope', run_id: 'RUN-A' })).status, 400);
     assert.equal((await api(t, 'member-a', t.token, '/v1/claims/renew', { task_id: 'TASK-1', run_id: 'RUN-A' })).status, 400);
     assert.equal((await api(t, 'member-a', 'wrong', '/v1/claims', { task_id: 'TASK-1', run_id: 'RUN-A' })).status, 401);
+  } finally {
+    await t.teardown();
+  }
+});
+
+// --- background agent (one pass = tick) -------------------------------------
+async function agentSetup() {
+  const t = await claimSetup();
+  const claims = new ClaimFile(t.dir);
+  const cfg = { coordinator_url: t.url, device_id: 'member-a', token: t.token };
+  const notices = [];
+  const pass = (over = {}) =>
+    tick({ claims, outbox: t.outbox, cfg, now: t.clock.t, notify: (title, msg) => notices.push(`${title}: ${msg}`), ...over });
+  const claim = async () => {
+    const r = await api(t, 'member-a', t.token, '/v1/claims', { task_id: 'TASK-1', run_id: 'RUN-A' });
+    claims.set('TASK-1', { run_id: 'RUN-A', generation: r.data.generation, expires_at: r.data.expires_at });
+  };
+  return { t, claims, cfg, notices, pass, claim };
+}
+
+test('agent pass renews held leases and delivers queued checkpoints', async () => {
+  const { t, claims, pass, claim } = await agentSetup();
+  try {
+    await claim();
+    t.outbox.add(makeEvent({ run_id: 'RUN-A', claim_generation: 1 }));
+    t.clock.t += LEASE - 1000;
+    const r = await pass();
+    assert.deepEqual(r.renewed, ['TASK-1']);
+    assert.equal(r.sent.acked, 1);
+    assert.ok(claims.get('TASK-1').expires_at > t.clock.t + LEASE - 2000, 'expiry moved forward');
+    t.clock.t += LEASE - 1000; // beyond the original lease: still ours only because the agent renewed
+    const early = await api(t, 'member-b', t.tokenB, '/v1/claims', { task_id: 'TASK-1', run_id: 'RUN-B' });
+    assert.equal(early.status, 409);
+  } finally {
+    await t.teardown();
+  }
+});
+
+test('agent pass drops a claim the coordinator no longer honours and says so', async () => {
+  const { t, claims, notices, pass, claim } = await agentSetup();
+  try {
+    await claim();
+    t.clock.t += LEASE + 1; // lease lapses with no renewal
+    await api(t, 'member-b', t.tokenB, '/v1/claims', { task_id: 'TASK-1', run_id: 'RUN-B' }); // someone else takes over
+    const r = await pass();
+    assert.equal(r.lost.length, 1);
+    assert.equal(claims.get('TASK-1'), null);
+    assert.match(notices[0], /Lost TASK-1/);
+  } finally {
+    await t.teardown();
+  }
+});
+
+test('agent keeps a claim through a coordinator outage until the lease would have lapsed', async () => {
+  const { t, claims, notices, pass, claim } = await agentSetup();
+  try {
+    await claim();
+    await close(t.server);
+    t.clock.t += 10_000;
+    const during = await pass();
+    assert.deepEqual(during.retrying, ['TASK-1']);
+    assert.ok(claims.get('TASK-1'));
+    t.clock.t += LEASE; // past the local expiry
+    const after = await pass();
+    assert.equal(after.lost.length, 1);
+    assert.equal(claims.get('TASK-1'), null);
+    assert.match(notices[0], /unreachable/);
+    t.server = createServer({ store: t.store, now: () => t.clock.t, leaseMs: LEASE }); // so teardown has something to close
+  } finally {
+    await t.teardown();
+  }
+});
+
+test('agent does not drop a claim because of a bad token (401 is a setup problem, not a lost claim)', async () => {
+  const { t, claims, cfg, claim, pass } = await agentSetup();
+  try {
+    await claim();
+    cfg.token = 'wrong';
+    const r = await pass();
+    assert.deepEqual(r.retrying, ['TASK-1']);
+    assert.ok(claims.get('TASK-1'));
   } finally {
     await t.teardown();
   }

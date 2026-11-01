@@ -62,6 +62,18 @@ node helper/cli.js checkpoint --task TASK-1 --summary "Payment screen implemente
 node helper/cli.js status                              # outbox counts
 ```
 
+## Run the helper in the background (laptops, and the mini as a builder)
+
+```bash
+service/helper-service.sh install     # LaunchAgent: renews held leases and delivers queued checkpoints every 30 s
+service/helper-service.sh status
+node helper/cli.js status             # outbox, claims held, and whether the agent is reporting
+service/helper-service.sh uninstall
+```
+
+After `claim`, nobody needs to run `heartbeat` or `flush`. If a claim is lost the agent drops it and shows a macOS notification.
+Windows laptops need an equivalent (Task Scheduler); not built yet.
+
 ## Not built yet (by design)
 
 Claim/lease validation (`claim_generation` is carried but not checked), cancellation, review workers, context
