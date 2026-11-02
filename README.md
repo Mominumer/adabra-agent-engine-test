@@ -74,6 +74,21 @@ service/helper-service.sh uninstall
 After `claim`, nobody needs to run `heartbeat` or `flush`. If a claim is lost the agent drops it and shows a macOS notification.
 Windows laptops need an equivalent (Task Scheduler); not built yet.
 
+## Assigning work
+
+Tasks come from GitHub issues. Label an issue `agent-task` and the coordinator creates `TASK-<issue number>` within a minute
+(it also runs `node coordinator/main.js task-sync` on demand). Add a label `assign:<device-id>` to reserve it for that
+enrolled device; without one, anyone can claim it. Closing the issue or removing the label closes the task. Tasks added by
+hand with `task-add` are never changed by the sync; use `task-assign <TASK-1> <device-id|none>` for those.
+
+```bash
+node coordinator/main.js tasks               # mini: every task, who it is reserved for, who holds it
+node helper/cli.js tasks                      # laptop: what you can work on (reserved for you first)
+node helper/cli.js claim-next                 # claim the first available one
+```
+
+A reserved task refuses everyone else's claim (`reserved for member-b`); a closed task refuses all claims.
+
 ## Not built yet (by design)
 
 Claim/lease validation (`claim_generation` is carried but not checked), cancellation, review workers, context

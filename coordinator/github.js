@@ -72,6 +72,20 @@ export class GitHubClient {
     return null;
   }
 
+  // Open and closed issues with a label (pull requests are included by GitHub and must be filtered by the caller).
+  async listIssues(label) {
+    const out = [];
+    for (let page = 1; page <= 10; page++) {
+      const list = await this.#req(
+        'GET',
+        `/repos/${this.repo}/issues?labels=${encodeURIComponent(label)}&state=all&per_page=100&page=${page}`,
+      );
+      out.push(...list);
+      if (list.length < 100) break;
+    }
+    return out;
+  }
+
   async createComment(issue, body) {
     return (await this.#req('POST', `/repos/${this.repo}/issues/${issue}/comments`, { body })).id;
   }

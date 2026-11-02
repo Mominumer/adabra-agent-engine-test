@@ -45,10 +45,16 @@ export class Store {
         state TEXT NOT NULL            -- held | released | cancelled
       );
     `);
-    // Databases created before claims existed: add the per-task generation counter.
+    // Databases created before a column existed: add it.
     const cols = this.db.prepare('PRAGMA table_info(tasks)').all().map((c) => c.name);
-    if (!cols.includes('generation')) {
-      this.db.exec('ALTER TABLE tasks ADD COLUMN generation INTEGER NOT NULL DEFAULT 0');
+    for (const [name, ddl] of [
+      ['generation', 'INTEGER NOT NULL DEFAULT 0'],
+      ['title', 'TEXT'],
+      ['assignee', 'TEXT'], // device_id this task is reserved for; NULL = anyone
+      ['closed', 'INTEGER NOT NULL DEFAULT 0'],
+      ['source', "TEXT NOT NULL DEFAULT 'manual'"], // 'github' = kept in step with the issue by task-sync
+    ]) {
+      if (!cols.includes(name)) this.db.exec(`ALTER TABLE tasks ADD COLUMN ${name} ${ddl}`);
     }
   }
 
@@ -75,6 +81,8 @@ export class Store {
     return this.#tx(() => {
       const task = this.getTask(taskId);
       if (!task) return { ok: false, reason: 'unknown_task' };
+      if (task.closed) return { ok: false, reason: 'closed' };
+      if (task.assignee && task.assignee !== deviceId) return { ok: false, reason: 'assigned', owner: task.assignee };
       const cur = this.#claimRow(taskId);
       if (cur && cur.state === 'held' && cur.expires_at > now) {
         if (cur.device_id === deviceId && cur.run_id === runId) {
@@ -210,6 +218,61 @@ export class Store {
 
   getTask(taskId) {
     return this.db.prepare('SELECT * FROM tasks WHERE task_id = ?').get(taskId);
+  }
+
+  getTaskByIssue(issueNumber) {
+    return this.db.prepare('SELECT * FROM tasks WHERE issue_number = ?').get(issueNumber);
+  }
+
+  // Reserve a task for one device (or null for anyone). Does not disturb a claim already held.
+  assignTask(taskId, deviceId) {
+    if (!this.getTask(taskId)) return { ok: false, reason: 'unknown_task' };
+    if (deviceId !== null) {
+      const d = this.db.prepare('SELECT revoked FROM devices WHERE device_id = ?').get(deviceId);
+      if (!d || d.revoked) return { ok: false, reason: 'unknown_device' };
+    }
+    this.db.prepare('UPDATE tasks SET assignee = ? WHERE task_id = ?').run(deviceId, taskId);
+    return { ok: true };
+  }
+
+  // Create or refresh a task mirrored from a GitHub issue. Keeps the comment id and generation.
+  upsertSyncedTask(taskId, issueNumber, { title, assignee, closed }) {
+    this.db
+      .prepare(
+        "INSERT INTO tasks (task_id, issue_number, title, assignee, closed, source) VALUES (?, ?, ?, ?, ?, 'github') " +
+          'ON CONFLICT(task_id) DO UPDATE SET title = excluded.title, assignee = excluded.assignee, ' +
+          "closed = excluded.closed, source = 'github'",
+      )
+      .run(taskId, issueNumber, title, assignee, closed ? 1 : 0);
+  }
+
+  hasActiveDevice(deviceId) {
+    const d = this.db.prepare('SELECT revoked FROM devices WHERE device_id = ?').get(deviceId);
+    return Boolean(d && !d.revoked);
+  }
+
+  // What this device can work on: open tasks reserved for it, then open unreserved ones; oldest issue first.
+  // `state`: yours (you hold the live lease) | available | busy (someone else holds a live lease).
+  tasksFor(deviceId, now) {
+    const rows = this.db
+      .prepare(
+        'SELECT task_id, issue_number, title, assignee FROM tasks ' +
+          'WHERE closed = 0 AND (assignee = ? OR assignee IS NULL) ' +
+          'ORDER BY (assignee IS NULL), issue_number',
+      )
+      .all(deviceId);
+    return rows.map((t) => {
+      const c = this.#claimRow(t.task_id);
+      const live = c && c.state === 'held' && c.expires_at > now;
+      return {
+        task_id: t.task_id,
+        issue: t.issue_number,
+        title: t.title,
+        reserved_for_you: t.assignee === deviceId,
+        state: !live ? 'available' : c.device_id === deviceId ? 'yours' : 'busy',
+        held_by: live ? c.device_id : null,
+      };
+    });
   }
 
   setTaskComment(taskId, commentId) {

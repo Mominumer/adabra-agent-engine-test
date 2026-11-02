@@ -83,3 +83,24 @@ export async function heartbeat(cfg, taskId, claim, { intervalMs = 30_000, signa
   }
   return { stopped: 'aborted' };
 }
+
+export async function listTasks({ url, deviceId, token, timeoutMs = 5000 }) {
+  const res = await fetch(`${url.replace(/\/$/, '')}/v1/tasks/mine`, {
+    signal: AbortSignal.timeout(timeoutMs),
+    headers: { 'x-device-id': deviceId, authorization: `Bearer ${token}` },
+  });
+  const data = await res.json().catch(() => ({}));
+  return { status: res.status, ok: res.ok, data };
+}
+
+// Plain-language reason for a refused claim.
+export function claimRefusal(r) {
+  const d = r.data ?? {};
+  switch (d.error) {
+    case 'claimed': return `already being worked on by ${d.owner}`;
+    case 'assigned': return `reserved for ${d.owner}`;
+    case 'closed': return 'the task is closed';
+    case 'unknown_task': return 'no such task';
+    default: return d.error ?? `http ${r.status}`;
+  }
+}

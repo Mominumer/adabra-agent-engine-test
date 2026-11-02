@@ -2,7 +2,9 @@
 // Local helper (runs on each builder laptop).
 //
 //   node helper/cli.js enroll <coordinator-url> <device-id>   (then put the token in $TEAM_AGENT_HOME/token)
+//   node helper/cli.js tasks                         (what you can work on: reserved for you first, then open ones)
 //   node helper/cli.js claim TASK-1                  (exclusive lease; needs the coordinator)
+//   node helper/cli.js claim-next                    (claims the first available task from that list)
 //   node helper/cli.js heartbeat TASK-1              (keeps the lease alive; stops if the claim is lost)
 //   node helper/cli.js checkpoint --task TASK-1 --status Building --summary "..." \
 //        [--verification "..."] [--next "..."]       (uses the run and generation from the claim)
@@ -20,7 +22,7 @@ import { parseArgs } from 'node:util';
 import { Outbox } from './outbox.js';
 import { flush } from './sender.js';
 import { validateEvent } from '../shared/event.js';
-import { ClaimFile, claimTask, heartbeat, newRunId, releaseClaim } from './claims.js';
+import { ClaimFile, claimRefusal, claimTask, heartbeat, listTasks, newRunId, releaseClaim } from './claims.js';
 
 const home = process.env.TEAM_AGENT_HOME ?? join(homedir(), '.team-agent');
 const configPath = join(home, 'config.json');
@@ -53,22 +55,46 @@ if (cmd === 'enroll') {
   writeFileSync(configPath, JSON.stringify({ coordinator_url: url, device_id: deviceId }, null, 2));
   console.log(`saved ${configPath}. Now save the device token (from the coordinator's device-add) to ${tokenPath}:`);
   console.log(`  umask 077 && pbpaste > "${tokenPath}"   # macOS: copy the token first`);
-} else if (cmd === 'claim') {
-  const taskId = rest[0];
-  if (!taskId) {
+} else if (cmd === 'tasks') {
+  const cfg = loadConfig();
+  const r = await listTasks({ url: cfg.coordinator_url, deviceId: cfg.device_id, token: cfg.token });
+  if (!r.ok) {
+    console.error(`could not list tasks: ${r.data.error ?? r.status}`);
+    process.exit(1);
+  }
+  if (!r.data.tasks.length) console.log('no open tasks for you');
+  for (const t of r.data.tasks) {
+    const who = t.state === 'yours' ? 'you hold it' : t.state === 'busy' ? `held by ${t.held_by}` : 'available';
+    console.log(`${t.task_id} (#${t.issue}) ${t.reserved_for_you ? '[reserved for you] ' : ''}${who}${t.title ? ` - ${t.title}` : ''}`);
+  }
+} else if (cmd === 'claim' || cmd === 'claim-next') {
+  const cfg = loadConfig();
+  const auth = { url: cfg.coordinator_url, deviceId: cfg.device_id, token: cfg.token };
+  let taskId = rest[0];
+  if (cmd === 'claim-next') {
+    const list = await listTasks(auth);
+    if (!list.ok) {
+      console.error(`could not list tasks: ${list.data.error ?? list.status}`);
+      process.exit(1);
+    }
+    taskId = list.data.tasks.find((t) => t.state === 'available')?.task_id;
+    if (!taskId) {
+      console.log('nothing available right now');
+      process.exit(0);
+    }
+  } else if (!taskId) {
     console.error('usage: claim <TASK-1>');
     process.exit(2);
   }
-  const cfg = loadConfig();
   const existing = claimFile.get(taskId);
   const runId = existing?.run_id ?? newRunId();
-  const r = await claimTask({ url: cfg.coordinator_url, deviceId: cfg.device_id, token: cfg.token }, taskId, runId);
+  const r = await claimTask(auth, taskId, runId);
   if (r.ok) {
     claimFile.set(taskId, { run_id: runId, generation: r.data.generation, expires_at: r.data.expires_at });
     console.log(`claimed ${taskId}: run ${runId}, generation ${r.data.generation}, lease ${Math.round(r.data.lease_ms / 1000)}s`);
-    console.log('keep it alive with: node helper/cli.js heartbeat ' + taskId);
+    console.log('the background agent keeps it alive (or run: node helper/cli.js heartbeat ' + taskId + ')');
   } else {
-    console.error(`not claimed: ${r.data.error ?? r.status}${r.data.owner ? ` (held by ${r.data.owner})` : ''}`);
+    console.error(`not claimed: ${claimRefusal(r)}`);
     process.exit(1);
   }
 } else if (cmd === 'heartbeat') {

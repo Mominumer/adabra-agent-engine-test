@@ -13,10 +13,12 @@ import { Outbox } from '../helper/outbox.js';
 import { flush } from '../helper/sender.js';
 import { ClaimFile } from '../helper/claims.js';
 import { tick } from '../helper/tick.js';
+import { syncTasks } from '../coordinator/sync.js';
 
 // --- fake GitHub: issue comments only ---------------------------------------
 function fakeGitHub() {
   const comments = []; // {id, issue, body}
+  const issues = []; // {number, title, state, labels:[{name}], pull_request?}
   let nextId = 1;
   let failing = false;
   const server = http.createServer((req, res) => {
@@ -27,6 +29,10 @@ function fakeGitHub() {
       if (failing) return json(503, { message: 'down' });
       if (req.headers.authorization !== 'Bearer gh-test-token') return json(401, {});
       let m;
+      if (req.method === 'GET' && req.url.startsWith('/repos/o/r/issues?')) {
+        const label = new URL(req.url, 'http://x').searchParams.get('labels');
+        return json(200, issues.filter((i) => i.labels.some((l) => l.name === label)));
+      }
       if ((m = req.url.match(/^\/repos\/o\/r\/issues\/(\d+)\/comments/))) {
         if (req.method === 'GET') return json(200, comments.filter((c) => c.issue === +m[1]));
         if (req.method === 'POST') {
@@ -46,6 +52,7 @@ function fakeGitHub() {
   });
   return {
     comments,
+    issues,
     setFailing: (v) => (failing = v),
     listen: () => new Promise((r) => server.listen(0, '127.0.0.1', () => r(server.address().port))),
     close: () => new Promise((r) => server.close(r)),
@@ -73,7 +80,7 @@ async function setup({ preclaim = true } = {}) {
   const port = await listen(server);
   const outbox = new Outbox(join(dir, 'outbox.db'));
   const ctx = {
-    dir, gh, store, worker, server, port, outbox, token, clock,
+    dir, gh, ghPort, store, worker, server, port, outbox, token, clock,
     url: `http://127.0.0.1:${port}`,
     send: (opts = {}) => flush({ outbox, url: ctx.url, deviceId: 'member-a', token, ...opts }),
     async teardown() {
@@ -532,6 +539,97 @@ test('agent does not drop a claim because of a bad token (401 is a setup problem
     const r = await pass();
     assert.deepEqual(r.retrying, ['TASK-1']);
     assert.ok(claims.get('TASK-1'));
+  } finally {
+    await t.teardown();
+  }
+});
+
+// --- assignment and task list ------------------------------------------------
+const mine = (t, id, token) =>
+  fetch(`${t.url}/v1/tasks/mine`, { headers: { 'x-device-id': id, authorization: `Bearer ${token}` } }).then(async (r) => ({
+    status: r.status, data: await r.json(),
+  }));
+
+test('a task reserved for one device cannot be claimed by another, and can by its owner', async () => {
+  const t = await claimSetup();
+  try {
+    assert.equal(t.store.assignTask('TASK-1', 'member-b').ok, true);
+    const a = await api(t, 'member-a', t.token, '/v1/claims', { task_id: 'TASK-1', run_id: 'RUN-A' });
+    assert.equal(a.status, 409);
+    assert.equal(a.data.error, 'assigned');
+    assert.equal(a.data.owner, 'member-b');
+    const b = await api(t, 'member-b', t.tokenB, '/v1/claims', { task_id: 'TASK-1', run_id: 'RUN-B' });
+    assert.equal(b.status, 200);
+    assert.equal(t.store.assignTask('TASK-1', 'ghost').reason, 'unknown_device');
+    assert.equal(t.store.assignTask('TASK-9', 'member-a').reason, 'unknown_task');
+  } finally {
+    await t.teardown();
+  }
+});
+
+test('task list: reserved-for-you first, then open ones; shows who holds what; excludes closed and other people\'s', async () => {
+  const t = await claimSetup();
+  try {
+    t.store.addTask('TASK-2', 2);
+    t.store.addTask('TASK-3', 3);
+    t.store.addTask('TASK-4', 4);
+    t.store.assignTask('TASK-3', 'member-a');
+    t.store.assignTask('TASK-4', 'member-b');
+    t.store.upsertSyncedTask('TASK-5', 5, { title: 'done already', assignee: null, closed: true });
+    await api(t, 'member-b', t.tokenB, '/v1/claims', { task_id: 'TASK-2', run_id: 'RUN-B' });
+    const r = await mine(t, 'member-a', t.token);
+    assert.equal(r.status, 200);
+    assert.deepEqual(r.data.tasks.map((x) => [x.task_id, x.state]), [['TASK-3', 'available'], ['TASK-1', 'available'], ['TASK-2', 'busy']]);
+    assert.equal(r.data.tasks[0].reserved_for_you, true);
+    assert.equal(r.data.tasks[2].held_by, 'member-b');
+    assert.equal((await mine(t, 'member-a', 'wrong')).status, 401);
+  } finally {
+    await t.teardown();
+  }
+});
+
+test('closed tasks cannot be claimed', async () => {
+  const t = await claimSetup();
+  try {
+    t.store.upsertSyncedTask('TASK-1', 1, { title: 'x', assignee: null, closed: true });
+    const r = await api(t, 'member-a', t.token, '/v1/claims', { task_id: 'TASK-1', run_id: 'RUN-A' });
+    assert.equal(r.status, 409);
+    assert.equal(r.data.error, 'closed');
+  } finally {
+    await t.teardown();
+  }
+});
+
+test('task sync: labelled issues become tasks, assign: label reserves, close and unlabel close the task, PRs and hand-made tasks are left alone', async () => {
+  const t = await claimSetup();
+  const github = new GitHubClient({ apiUrl: `http://127.0.0.1:${t.ghPort}`, repo: 'o/r', token: 'gh-test-token', timeoutMs: 2000 });
+  try {
+    const L = (...n) => n.map((name) => ({ name }));
+    t.gh.issues.push(
+      { number: 7, title: 'Add payments', state: 'open', labels: L('agent-task', 'assign:member-b') },
+      { number: 8, title: 'Fix login', state: 'open', labels: L('agent-task') },
+      { number: 9, title: 'Typo PR', state: 'open', labels: L('agent-task'), pull_request: {} },
+      { number: 10, title: 'Ghost owner', state: 'open', labels: L('agent-task', 'assign:nobody') },
+      { number: 1, title: 'Hand-made task issue', state: 'open', labels: L('agent-task') },
+    );
+    const logs = [];
+    const first = await syncTasks({ store: t.store, github, log: (m) => logs.push(m) });
+    assert.equal(first.created, 3);
+    assert.equal(t.store.getTask('TASK-7').assignee, 'member-b');
+    assert.equal(t.store.getTask('TASK-8').assignee, null);
+    assert.equal(t.store.getTask('TASK-9'), undefined);
+    assert.equal(t.store.getTask('TASK-10').assignee, null);
+    assert.ok(logs.some((m) => m.includes('nobody')));
+    assert.equal(t.store.getTask('TASK-1').title, null, 'the hand-made task is not overwritten');
+    assert.equal((await syncTasks({ store: t.store, github })).created + (await syncTasks({ store: t.store, github })).updated, 0, 'idempotent');
+
+    t.gh.issues[0].state = 'closed'; // issue closed
+    t.gh.issues.splice(1, 1); // label removed from 8
+    const second = await syncTasks({ store: t.store, github });
+    assert.equal(second.updated, 2);
+    assert.equal(t.store.getTask('TASK-7').closed, 1);
+    assert.equal(t.store.getTask('TASK-8').closed, 1);
+    assert.equal(t.store.getTask('TASK-10').closed, 0);
   } finally {
     await t.teardown();
   }

@@ -53,13 +53,23 @@ export function createServer({ store, log = () => {}, now = () => Date.now(), le
 
   const claimResponse = (res, r, extra = {}) => {
     if (r.ok) return send(res, 200, { status: 'ok', generation: r.generation, expires_at: r.expires_at, ...extra });
-    const code = r.reason === 'unknown_task' ? 422 : 409;
+    const code = r.reason === 'unknown_task' ? 422 : 409; // claimed, assigned, closed, expired ... all conflicts
     return send(res, code, { error: r.reason, owner: r.owner, expires_at: r.expires_at });
   };
 
   return http.createServer(async (req, res) => {
     try {
       if (req.method === 'GET' && req.url === '/healthz') return send(res, 200, { ok: true });
+
+      if (req.method === 'GET' && req.url === '/v1/tasks/mine') {
+        const deviceId = req.headers['x-device-id'];
+        const auth = req.headers.authorization ?? '';
+        if (!store.authenticate(deviceId, auth.startsWith('Bearer ') ? auth.slice(7) : '')) {
+          log(`401 device=${String(deviceId).slice(0, 40)}`);
+          return send(res, 401, { error: 'unauthorized' });
+        }
+        return send(res, 200, { tasks: store.tasksFor(deviceId, now()) });
+      }
 
       if (req.method === 'POST' && req.url.startsWith('/v1/')) {
         const deviceId = req.headers['x-device-id'];

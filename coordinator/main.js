@@ -5,7 +5,10 @@
 //   node coordinator/main.js device-add <device-id>      (prints the token once)
 //   node coordinator/main.js device-rotate <device-id>   (new token; the old one stops working)
 //   node coordinator/main.js device-revoke <device-id>
-//   node coordinator/main.js task-add <TASK-1> <issue-number>
+//   node coordinator/main.js task-add <TASK-1> <issue-number> [device-id]   (optionally reserved for a device)
+//   node coordinator/main.js task-assign <TASK-1> <device-id|none>
+//   node coordinator/main.js tasks                        (all tasks, who they are reserved for, who holds them)
+//   node coordinator/main.js task-sync                    (mirror issues labelled agent-task now; serve does it every 60 s)
 //   node coordinator/main.js claims                       (who holds which task)
 //   node coordinator/main.js claim-cancel <TASK-1>        (operator: fence the current owner)
 //   node coordinator/main.js status
@@ -21,6 +24,7 @@ import { Store } from './store.js';
 import { GitHubClient } from './github.js';
 import { Worker } from './worker.js';
 import { createServer } from './server.js';
+import { syncTasks } from './sync.js';
 
 const log = (m) => console.log(`${new Date().toISOString()} ${m}`);
 const [cmd, ...args] = process.argv.slice(2);
@@ -41,6 +45,25 @@ if (cmd === 'device-add' && args[0]) {
 } else if (cmd === 'task-add' && args[0] && Number.isInteger(Number(args[1]))) {
   store.addTask(args[0], Number(args[1]));
   console.log(`${args[0]} -> issue #${args[1]}`);
+  if (args[2]) {
+    const r = store.assignTask(args[0], args[2]);
+    console.log(r.ok ? `reserved for ${args[2]}` : `not reserved: ${r.reason}`);
+  }
+} else if (cmd === 'task-assign' && args[0] && args[1]) {
+  const r = store.assignTask(args[0], args[1] === 'none' ? null : args[1]);
+  console.log(r.ok ? `${args[0]} is now ${args[1] === 'none' ? 'open to anyone' : `reserved for ${args[1]}`}` : `failed: ${r.reason}`);
+} else if (cmd === 'tasks') {
+  for (const t of store.db.prepare('SELECT * FROM tasks ORDER BY issue_number').all()) {
+    const c = store.currentClaim(t.task_id);
+    const live = c && c.state === 'held' && c.expires_at > Date.now();
+    console.log(
+      `${t.task_id} (#${t.issue_number}) ${t.closed ? 'CLOSED' : 'open'} ${t.source}: ` +
+        `${t.assignee ? `reserved for ${t.assignee}` : 'anyone'}, ${live ? `held by ${c.device_id}` : 'not held'}${t.title ? ` - ${t.title}` : ''}`,
+    );
+  }
+} else if (cmd === 'task-sync') {
+  const token = readFileSync(process.env.GITHUB_TOKEN_FILE, 'utf8').trim();
+  console.log(await syncTasks({ store, github: new GitHubClient({ repo: process.env.GITHUB_REPO, token }), log }));
 } else if (cmd === 'claim-cancel' && args[0]) {
   const r = store.cancelClaim(args[0]);
   console.log(r.ok ? `cancelled ${args[0]}; generation is now ${r.generation}, the old owner's output is fenced` : `failed: ${r.reason}`);
@@ -73,6 +96,12 @@ if (cmd === 'device-add' && args[0]) {
   const host = process.env.COORDINATOR_HOST ?? '127.0.0.1';
   const port = Number(process.env.COORDINATOR_PORT ?? 8787);
   const leaseMs = Number(process.env.COORDINATOR_LEASE_MS ?? 180_000);
+  if (process.env.GITHUB_DRY_RUN !== '1') {
+    const syncEvery = Number(process.env.COORDINATOR_SYNC_MS ?? 60_000);
+    const run = () => syncTasks({ store, github, log }).catch((err) => log(`task sync failed: ${err.message}`));
+    run();
+    setInterval(run, syncEvery).unref();
+  }
   createServer({ store, log, leaseMs }).listen(port, host, () => log(`coordinator listening on ${host}:${port}`));
 } else {
   usage();
