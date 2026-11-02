@@ -9,12 +9,27 @@
 //        NIGHT_IMAGE      the image to check (default adabra-night:dev)
 //        NIGHT_IMAGE_ID   when set, the image must be exactly this: docker image inspect <image> --format '{{.Id}}'
 //        NIGHT_DOCKER     the docker command (default docker)
+//   node night/main.js status
+//        what is in force and what happened last. Local, fixed words and counts. Agents may run it
+//   node night/main.js report [YYYY-MM-DD]
+//        the morning report: local, with no model text. Agents may run it
+//   node night/main.js run-once <TASK-N>
+//        one supervised run of that task. A terminal and a typed confirmation. Ignores the night window and nothing else. Agents must not
+//   node night/main.js serve [--check]
+//        the unattended service: see service/night-service.sh. Refuses unless NIGHT_REQUIRED_REVIEW_ON=yes. Agents must not
+//
+// The last four take their settings from the environment: see settings.js.
 import { checkApprovalCommand } from './check-approval.js';
 import { nightCheckCommand } from './check.js';
+import { reportCommand, runOnceCommand, serveCommand, statusCommand } from './commands.js';
 
 const COMMANDS = {
   'check-approval': checkApprovalCommand,
   'night-check': nightCheckCommand,
+  status: statusCommand,
+  report: reportCommand,
+  'run-once': runOnceCommand,
+  serve: serveCommand,
 };
 
 const [cmd, ...args] = process.argv.slice(2);

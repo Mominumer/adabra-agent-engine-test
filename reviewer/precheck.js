@@ -14,8 +14,8 @@ const HIDDEN = /[\u{202A}-\u{202E}\u{2066}-\u{2069}\u{E0000}-\u{E007F}]/u;
 const ZERO_WIDTH = /[\u{061C}\u{200B}-\u{200F}\u{2060}\u{FEFF}]/u;
 const ATTENTION_MAX = 50;
 
-const READ_YOURSELF = [
-  /^reviewer\//, /^service\//, /^coordinator\//, /^\.github\//,
+export const READ_YOURSELF = [
+  /^reviewer\//, /^service\//, /^coordinator\//, /^night\//, /^ops\//, /^shared\//, /^helper\//, /^\.github\//,
   /(^|\/)\.claude\//i, /(^|\/)claude(\.local)?\.md$/i, /(^|\/)agents\.md$/i, /(^|\/)\.mcp\.json$/i,
   /(^|\/)package\.json$/, /(^|\/)(package-lock\.json|npm-shrinkwrap\.json|yarn\.lock|pnpm-lock\.yaml|bun\.lockb?)$/,
   /(^|\/)(tests?|__tests__)\//, /\.(test|spec)\.[^/]+$/,

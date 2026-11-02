@@ -294,9 +294,9 @@ test('pre-checks: a changed file GitHub will not show blocks, unless there is no
 });
 
 test('pre-checks: the sensitive paths go on the list to read', () => {
-  const sensitive = ['reviewer/main.js', 'service/x.sh', 'coordinator/a.js', '.github/workflows/ci.yml', '.claude/settings.json', 'sub/.claude/x', 'CLAUDE.md', 'sub/claude.local.md', 'AGENTS.md', '.mcp.json', 'package.json', 'web/package.json', 'package-lock.json', 'yarn.lock', 'pnpm-lock.yaml', 'test/a.js', 'src/tests/a.js', 'src/__tests__/a.js', 'src/a.test.js', 'src/a.spec.ts'];
+  const sensitive = ['reviewer/main.js', 'service/x.sh', 'coordinator/a.js', 'night/runner.js', 'ops/main.js', 'shared/stop.js', 'helper/claims.js', '.github/workflows/ci.yml', '.claude/settings.json', 'sub/.claude/x', 'CLAUDE.md', 'sub/claude.local.md', 'AGENTS.md', '.mcp.json', 'package.json', 'web/package.json', 'package-lock.json', 'yarn.lock', 'pnpm-lock.yaml', 'test/a.js', 'src/tests/a.js', 'src/__tests__/a.js', 'src/a.test.js', 'src/a.spec.ts'];
   for (const name of sensitive) assert.deepEqual(pre([changed(name)]).attention, [name], name);
-  for (const name of ['src/a.js', 'docs/reviewer/notes.md', 'contest/a.js', 'README.md']) assert.deepEqual(pre([changed(name)]).attention, [], name);
+  for (const name of ['src/a.js', 'docs/reviewer/notes.md', 'docs/night/notes.md', 'contest/a.js', 'README.md']) assert.deepEqual(pre([changed(name)]).attention, [], name);
   assert.deepEqual(pre([changed('src/moved.js', 'x', { status: 'renamed', previous_filename: 'reviewer/moved.js' })]).attention, ['src/moved.js'], 'moving a file out still counts');
   const many = Array.from({ length: 70 }, (_, i) => changed(`test/${i}.js`));
   const listed = pre(many).attention;
