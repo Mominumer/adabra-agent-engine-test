@@ -152,8 +152,8 @@ export function claudeReview({
     if (written.final) return shaped({ ...written.final, reviewer: PRECHECK_REVIEWER });
     try {
       // The last moment before spending. Fetching and cleaning take time, and a push may have landed meanwhile.
-      const head = await github.pullHead(job.pr);
-      if (!head.open || head.sha !== job.sha) throw new ReviewSuperseded();
+      const head = await github.getPull(job.pr);
+      if (!head || head.state !== 'open' || head.sha !== job.sha) throw new ReviewSuperseded();
       // Counted before it starts, so a crash during the run still counts it.
       const runId = store.beginReviewRun({ ...key, now: now(), cap: dailyCap });
       if (runId === null) throw new ReviewPaused('daily', nextUtcMidnight(now()));

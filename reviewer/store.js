@@ -149,6 +149,14 @@ export class ReviewStore {
     });
   }
 
+  // Back to the queue, taking back the attempt markRunning counted, so it can never use up its attempts this way.
+  // For when the fault is not the job's: see the dispatcher.
+  holdJob(pr, sha, error, nextAttemptAt) {
+    this.db
+      .prepare("UPDATE jobs SET state = 'queued', attempts = MAX(attempts - 1, 0), next_attempt_at = ?, last_error = ? WHERE pr = ? AND sha = ?")
+      .run(nextAttemptAt, String(error).slice(0, 500), pr, sha);
+  }
+
   // --- results for the coordinator ----------------------------------------
   // Oldest first. The coordinator decides what is stale, so order here is only a courtesy.
   dueTaskResults(now) {
@@ -189,13 +197,6 @@ export class ReviewStore {
     return this.db
       .prepare("SELECT task_id, pr, sha, status, attempts, last_error FROM task_results WHERE status != 'acked' ORDER BY created_at DESC LIMIT ?")
       .all(limit);
-  }
-
-  // Back to the queue until `until`, as if this run had not happened: pauses say nothing about the job, so they use no attempt.
-  defer(pr, sha, until, why) {
-    this.db
-      .prepare("UPDATE jobs SET state = 'queued', attempts = MAX(attempts - 1, 0), next_attempt_at = ?, last_error = ? WHERE pr = ? AND sha = ?")
-      .run(until, String(why).slice(0, 500), pr, sha);
   }
 
   markSuperseded(pr, sha) {
@@ -307,6 +308,11 @@ export class ReviewStore {
   // After a crash or restart, anything left 'running' never finished: run it again.
   requeueInterrupted() {
     return this.db.prepare("UPDATE jobs SET state = 'queued' WHERE state = 'running'").run().changes;
+  }
+
+  // Back to the queue because of the operator's stop, not because anything failed: this run does not count against the job.
+  parkJob(pr, sha) {
+    this.db.prepare("UPDATE jobs SET state = 'queued', attempts = MAX(attempts - 1, 0) WHERE pr = ? AND sha = ?").run(pr, sha);
   }
 
   getJob(pr, sha) {

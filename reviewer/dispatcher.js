@@ -2,6 +2,7 @@ import { REVIEW_MARKER } from './github.js';
 import { buildResult, parseTaskId } from './task-results.js';
 import { ReviewPaused, ReviewSuperseded, STATUS_TEXT } from './review-output.js';
 import { fence, plain, quiet } from '../shared/sanitize.js';
+import { AUTH_HOLD_MS, upsertComment } from '../shared/github-auth.js';
 
 export const CONTEXTS = { tests: 'adabra/tests', review: 'adabra/review' };
 export const SHADOW_CONTEXT = 'adabra/review-shadow'; // not required by branch protection, and not in CONTEXTS: only compared, never waited for
@@ -67,8 +68,9 @@ export function renderComment(job, tests, review) {
 export class Dispatcher {
   // linkTasks: queue a result for the coordinator when a job belongs to a task. Off when this reviewer has no device identity.
   // shadowReview: a second review to compare, run after the job is done. Its verdict goes to its own status and its findings to the log.
-  constructor({ store, github, repo, authors, runTests, runReview, shadowReview = null, now = () => Date.now(), log = () => {}, linkTasks = false }) {
-    Object.assign(this, { store, github, repo, runTests, runReview, shadowReview, now, log, linkTasks });
+  // isStopped: the operator's emergency stop. While it is true nothing starts and GitHub is not written to.
+  constructor({ store, github, repo, authors, runTests, runReview, shadowReview = null, now = () => Date.now(), log = () => {}, linkTasks = false, isStopped = () => false }) {
+    Object.assign(this, { store, github, repo, runTests, runReview, shadowReview, now, log, linkTasks, isStopped });
     this.authors = new Set(authors);
     this.skipped = new Set(); // log each skipped PR commit once, not every poll
   }
@@ -88,6 +90,7 @@ export class Dispatcher {
 
   // Queue every new head commit of eligible open PRs and mark it pending on GitHub.
   async poll() {
+    if (this.isStopped()) return 0; // a push made meanwhile is still the head commit at the first poll after resume
     let queued = 0;
     for (const pr of await this.github.openPulls()) {
       const why = this.eligible(pr);
@@ -109,31 +112,68 @@ export class Dispatcher {
 
   // Run the oldest due job. Returns the job's outcome, or null when there is nothing to do.
   async runOnce() {
+    if (this.isStopped()) return null;
     const job = this.store.next(this.now());
     if (!job) return null;
+    this.running = true;
+    this.interrupted = false;
+    try {
+      return await this.#run(job);
+    } finally {
+      this.running = false;
+    }
+  }
+
+  // A stop has taken effect. True while a job is running: the caller ends its containers, and what comes back is not posted.
+  interrupt() {
+    if (!this.running) return false;
+    this.interrupted = true;
+    return true;
+  }
+
+  // Sticky for the job: a resume a moment later does not make a killed run's result worth posting.
+  #halted() {
+    if (this.isStopped()) this.interrupted = true;
+    return this.interrupted;
+  }
+
+  async #run(job) {
     this.store.markRunning(job.pr, job.sha);
     this.log(`PR #${job.pr} ${job.sha.slice(0, 12)} running`);
-    let tests, review;
+    let tests, review, testCrash, reviewCrash;
     try {
       tests = normalize(await this.runTests(job), 'test');
     } catch (err) {
-      // The machinery failed (e.g. Docker down), not the PR: say so on GitHub and try again later.
-      return this.#retry(job, `runner: ${err.message}`, 'Review infrastructure problem; retrying');
+      testCrash = err;
     }
-    try {
-      review = await this.#review(job, tests);
-    } catch (err) {
-      if (err instanceof ReviewPaused) return this.#paused(job, tests, err);
-      if (err instanceof ReviewSuperseded) return this.#superseded(job, tests, err);
-      // The tests did finish, so their real result still goes up while the review waits for another try.
-      return this.#retry(job, `runner: ${err.message}`, 'Review infrastructure problem; retrying', tests);
+    if (!testCrash && !this.#halted()) {
+      try {
+        review = await this.#review(job, tests);
+      } catch (err) {
+        reviewCrash = err;
+      }
     }
+    // Checked once, before the first post: a stop either keeps the whole result off GitHub or lets all of it finish. What a stopped
+    // run returned says nothing about the PR (a killed container looks like a failure), so the job goes back to the queue, unposted.
+    // A paid review that had already started is the one thing a stop cannot end. Its result is stored, so the job gets it for nothing
+    // after the resume.
+    if (this.#halted()) {
+      this.store.parkJob(job.pr, job.sha);
+      this.log(`PR #${job.pr} ${job.sha.slice(0, 12)} back in the queue: stopped by the operator`);
+      return { pr: job.pr, sha: job.sha, parked: true };
+    }
+    // The machinery failed (e.g. Docker down), not the PR: say so on GitHub and try again later.
+    if (testCrash) return this.#retry(job, `runner: ${testCrash.message}`, 'Review infrastructure problem; retrying', testCrash);
+    if (reviewCrash instanceof ReviewPaused) return this.#paused(job, tests, reviewCrash);
+    if (reviewCrash instanceof ReviewSuperseded) return this.#superseded(job, tests, reviewCrash);
+    // The tests did finish, so their real result still goes up while the review waits for another try.
+    if (reviewCrash) return this.#retry(job, `runner: ${reviewCrash.message}`, 'Review infrastructure problem; retrying', reviewCrash, tests);
     try {
       await this.github.setStatus(job.sha, CONTEXTS.tests, tests.state, tests.summary || tests.state);
       await this.github.setStatus(job.sha, CONTEXTS.review, review.state, review.summary || review.state);
       await this.#upsertComment(job, renderComment(job, tests, review));
     } catch (err) {
-      return this.#retry(job, `github: ${err.message}`, null);
+      return this.#retry(job, `github: ${err.message}`, null, err);
     }
     // Only now, with the statuses posted: the job and its result for the task are saved together, or not at all.
     this.store.markDone(job.pr, job.sha, { tests: tests.state, review: review.state }, this.#taskResult(job, tests, review));
@@ -152,7 +192,7 @@ export class Dispatcher {
   // without using an attempt. No result for the task: this is not an outcome. It is deferred first, so a GitHub failure cannot lose that.
   async #paused(job, tests, paused) {
     const until = paused.until ?? this.now() + OPERATOR_RECHECK_MS;
-    this.store.defer(job.pr, job.sha, until, paused.message);
+    this.store.holdJob(job.pr, job.sha, paused.message, until);
     this.log(`PR #${job.pr} ${job.sha.slice(0, 12)} waiting: ${paused.message}, next try ${new Date(until).toISOString()}`);
     const review = normalize({ state: 'error', summary: paused.statusText }, 'review');
     try {
@@ -211,7 +251,14 @@ export class Dispatcher {
   }
 
   // `tests`: the tests' result, when they finished and it was the review that failed.
-  async #retry(job, error, statusText, tests = null) {
+  async #retry(job, error, statusText, cause, tests = null) {
+    // Our own credentials are out, which says nothing about this job: it waits, however long that takes, and no attempt is used.
+    // No status either, as GitHub would refuse it.
+    if (cause?.authOutage) {
+      this.store.holdJob(job.pr, job.sha, error, this.now() + AUTH_HOLD_MS);
+      this.log(`PR #${job.pr} ${job.sha.slice(0, 12)} held, not counted as an attempt: ${error}`);
+      return { pr: job.pr, sha: job.sha, retry: true, failed: false };
+    }
     // Giving up is an outcome the task should hear about too, or it goes on showing the verdict on an older commit.
     // The reason stays here: it is machinery detail, and the task's comment is public.
     const gaveUp = { state: 'error', summary: GAVE_UP, findings: [], reviewer: null };
@@ -228,18 +275,17 @@ export class Dispatcher {
   }
 
   async #upsertComment(job, body) {
-    let id = this.store.commentId(job.pr);
-    if (id) {
-      try {
-        return await this.github.updateComment(id, body);
-      } catch (err) {
-        if (err.status !== 404) throw err; // deleted by someone: find or recreate below
-      }
-    }
-    // Found by its marker, so a crash between creating it and remembering its id cannot create a second one.
-    const found = await this.github.findReviewComment(job.pr);
-    if (found) await this.github.updateComment(found, body);
-    this.store.setCommentId(job.pr, found ?? (await this.github.createComment(job.pr, body)));
+    const remembered = this.store.commentId(job.pr);
+    const id = await upsertComment({
+      remembered,
+      label: `PR #${job.pr}`,
+      log: this.log,
+      // Found by its marker, so a crash between creating it and remembering its id cannot create a second one.
+      find: () => this.github.findReviewComment(job.pr),
+      update: (commentId) => this.github.updateComment(commentId, body),
+      create: () => this.github.createComment(job.pr, body),
+    });
+    if (id !== remembered) this.store.setCommentId(job.pr, id);
   }
 }
 

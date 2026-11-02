@@ -559,13 +559,13 @@ test('strikes count in a row and survive a pause, until something recognised hap
   assert.equal(store.addStrike(), 1);
 });
 
-test('defer gives the attempt back and clearing a pause brings the waiting jobs forward', (t) => {
+test('holding a job gives the attempt back, and clearing a pause brings the waiting jobs forward', (t) => {
   const store = new ReviewStore(tempDb(t));
   t.after(() => store.close());
   store.enqueue(1, SHA, {}, 5);
   store.markRunning(1, SHA);
   assert.equal(store.getJob(1, SHA).attempts, 1);
-  store.defer(1, SHA, NOW + 1000, 'why');
+  store.holdJob(1, SHA, 'why', NOW + 1000);
   const job = store.getJob(1, SHA);
   assert.deepEqual([job.state, job.attempts, job.next_attempt_at, job.last_error], ['queued', 0, NOW + 1000, 'why']);
   assert.equal(store.next(NOW), null);
@@ -579,7 +579,7 @@ test('defer gives the attempt back and clearing a pause brings the waiting jobs 
   assert.equal(store.next(0).pr, 1);
 
   store.enqueue(2, SHA, {}, 6);
-  store.defer(2, SHA, NOW + 5000, 'why');
+  store.holdJob(2, SHA, 'why', NOW + 5000);
   store.pauseForAuth();
   store.clearAuthPause();
   assert.equal(store.next(0).pr, 1);

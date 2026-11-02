@@ -107,9 +107,9 @@ function fakeGitHub() {
       return { files: gh.files, truncated: gh.truncated };
     },
     downloadTarball: async () => (gh.tarballs++, Buffer.from('a tarball')),
-    pullHead: async (pr) => {
+    getPull: async (pr) => {
       if (gh.failHead) throw new Error('head: GitHub down');
-      return gh.heads.get(pr);
+      return gh.heads.get(pr) ?? null;
     },
     setStatus: async (sha, context, state, description) => {
       if (gh.failPosts) throw new Error('post: GitHub down');
@@ -155,7 +155,7 @@ function setup(t, { env = { REVIEW_ENGINE: 'claude', REVIEW_DAILY_CAP: '100000' 
     dir, stack, store, gh, clock, logs, d, testCalls,
     queue(meta = {}, pr = nextPr++, sha = shaOf(pr)) {
       store.enqueue(pr, sha, { branch: `feature/${pr}`, base: 'main', author: 'alice', title: 'Title', body: '', ...meta }, clock.t);
-      gh.heads.set(pr, { sha, open: true });
+      gh.heads.set(pr, { sha, state: 'open' });
       return { pr, sha };
     },
     control: (c) => writeFileSync(stack.control, JSON.stringify(c)),
@@ -807,7 +807,7 @@ test('the zero-width and sensitive-path list goes in the comment, and blocks not
 test('the head is checked just before spending: a moved or closed PR costs nothing, and an unknown head costs nothing either', async (t) => {
   const h = setup(t);
   const moved = h.queue();
-  h.gh.heads.set(moved.pr, { sha: 'f'.repeat(40), open: true });
+  h.gh.heads.set(moved.pr, { sha: 'f'.repeat(40), state: 'open' });
   const r = await h.d.runOnce();
   assert.equal(r.superseded, true);
   assert.equal(h.calls().length, 0);
@@ -819,7 +819,7 @@ test('the head is checked just before spending: a moved or closed PR costs nothi
   assert.deepEqual(h.store.taskResultCounts(), {});
 
   const closed = h.queue();
-  h.gh.heads.set(closed.pr, { sha: closed.sha, open: false });
+  h.gh.heads.set(closed.pr, { sha: closed.sha, state: 'closed' });
   assert.equal((await h.d.runOnce()).superseded, true);
   assert.equal(h.calls().length, 0);
 

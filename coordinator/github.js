@@ -1,5 +1,6 @@
 import { findingLocation, VERDICT_TEXT } from '../shared/review-result.js';
 import { codeSpan, fence, plain, quiet } from '../shared/sanitize.js';
+import { apiError, findMarkedComment, sendAuthorized, StaticToken } from '../shared/github-auth.js';
 
 // Minimal GitHub client: one progress comment per task, found by a hidden marker
 // so a crash between "create" and "remember the id" cannot produce duplicates.
@@ -68,48 +69,47 @@ export function renderComment(event, review = null) {
   ].join('\n');
 }
 
+// What an app token is asked for. The coordinator only reads issues and writes their comments, so it gets nothing else.
+export const COORDINATOR_PERMISSIONS = { issues: 'write' };
+
 export class GitHubClient {
-  constructor({ apiUrl = 'https://api.github.com', repo, token, timeoutMs = 10_000 }) {
+  // `token` is a fine-grained token; `auth` is a GitHub App's tokens instead (shared/github-auth.js).
+  constructor({ apiUrl = 'https://api.github.com', repo, token, auth = null, timeoutMs = 10_000 }) {
     this.apiUrl = apiUrl.replace(/\/$/, '');
     this.repo = repo;
-    this.token = token;
+    this.auth = auth ?? new StaticToken(token);
     this.timeoutMs = timeoutMs;
   }
 
   async #req(method, path, body) {
-    const res = await fetch(`${this.apiUrl}${path}`, {
-      method,
-      signal: AbortSignal.timeout(this.timeoutMs),
-      headers: {
-        authorization: `Bearer ${this.token}`,
-        accept: 'application/vnd.github+json',
-        'x-github-api-version': '2022-11-28',
-        'content-type': 'application/json',
-        'user-agent': 'adabra-agent-engine-test',
-      },
-      body: body ? JSON.stringify(body) : undefined,
-    });
+    const res = await sendAuthorized(this.auth, (token) =>
+      fetch(`${this.apiUrl}${path}`, {
+        method,
+        signal: AbortSignal.timeout(this.timeoutMs),
+        headers: {
+          authorization: `Bearer ${token}`,
+          accept: 'application/vnd.github+json',
+          'x-github-api-version': '2022-11-28',
+          'content-type': 'application/json',
+          'user-agent': 'adabra-agent-engine-test',
+        },
+        body: body ? JSON.stringify(body) : undefined,
+      }),
+    );
     if (!res.ok) {
       const text = await res.text().catch(() => '');
-      const err = new Error(`GitHub ${method} ${path} -> ${res.status} ${text.slice(0, 200)}`);
-      err.status = res.status;
-      throw err;
+      throw apiError(this.auth, res, `GitHub ${method} ${path} -> ${res.status} ${text.slice(0, 200)}`, text);
     }
     return res.status === 204 ? null : res.json();
   }
 
   async findProgressComment(issue, taskId) {
     const m = marker(taskId);
-    for (let page = 1; page <= 10; page++) {
-      const list = await this.#req(
-        'GET',
-        `/repos/${this.repo}/issues/${issue}/comments?per_page=100&page=${page}`,
-      );
-      const hit = list.find((c) => typeof c.body === 'string' && c.body.startsWith(m));
-      if (hit) return hit.id;
-      if (list.length < 100) break;
-    }
-    return null;
+    return findMarkedComment({
+      auth: this.auth,
+      hasMarker: (body) => body.startsWith(m),
+      listPage: (page) => this.#req('GET', `/repos/${this.repo}/issues/${issue}/comments?per_page=100&page=${page}`),
+    });
   }
 
   // Open and closed issues with a label (pull requests are included by GitHub and must be filtered by the caller).
