@@ -12,14 +12,21 @@ const EMPTY_BLOB = 'e69de29bb2d1d6434b8b29ae775ad8c2e48c5391';
 const HIDDEN = /[\u{202A}-\u{202E}\u{2066}-\u{2069}\u{E0000}-\u{E007F}]/u;
 // Legitimate in emoji and some scripts, so these are for a person to look at, not a reason to block.
 const ZERO_WIDTH = /[\u{061C}\u{200B}-\u{200F}\u{2060}\u{FEFF}]/u;
+// A line ending to `node` and others, though not to git: what follows it reads as part of the line above, and runs. A CR at the very end
+// is only a CRLF file.
+const BREAK_INSIDE_LINE = /\r(?!$)|[\u2028\u2029]/;
+// Can rewrite what a terminal shows, or is not text. Tab, and the CR above, are left out. For a person to look at.
+const CONTROL = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F]/;
 const ATTENTION_MAX = 50;
 
 // All ignore case: on a Mac or Windows disk, Service/x.sh lands in service/.
 export const READ_YOURSELF = [
-  /^reviewer\//i, /^service\//i, /^coordinator\//i, /^night\//i, /^ops\//i, /^shared\//i, /^helper\//i, /^\.github\//i,
+  /^reviewer\//i, /^service\//i, /^coordinator\//i, /^night\//i, /^ops\//i, /^shared\//i, /^helper\//i, /^backup\//i, /^onboarding\//i, /^\.github\//i,
   /(^|\/)\.claude\//i, /(^|\/)claude(\.local)?\.md$/i, /(^|\/)agents\.md$/i, /(^|\/)\.mcp\.json$/i,
   /(^|\/)package\.json$/i, /(^|\/)(package-lock\.json|npm-shrinkwrap\.json|yarn\.lock|pnpm-lock\.yaml|bun\.lockb?)$/i,
   /(^|\/)(tests?|__tests__)\//i, /\.(test|spec)\.[^/]+$/i,
+  // These run code on a checkout, or on `npm test`.
+  /(^|\/)node_modules\//i, /(^|\/)\.(npmrc|yarnrc(\.yml)?|pnpmfile\.cjs|envrc)$/i, /(^|\/)\.(husky|vscode|devcontainer)\//i,
 ];
 
 // Line numbers (in the new file) of every line the patch adds.
@@ -89,8 +96,12 @@ export function preCheck({ files, truncated = false, title = '', body = '', unsh
     for (const a of addedLines(f.patch)) {
       if (HIDDEN.test(a.text)) {
         blockers.push({ file: f.filename, line: a.line, severity: 'blocker', message: 'Added line holds hidden Unicode (bidi controls or tag characters).' });
+      } else if (BREAK_INSIDE_LINE.test(a.text)) {
+        blockers.push({ file: f.filename, line: a.line, severity: 'blocker', message: 'Added line holds a line break that git does not count (a CR or U+2028), so code can hide behind a comment.' });
       } else if (ZERO_WIDTH.test(a.text)) {
         attention.push(`${f.filename}:${a.line} (zero-width character)`);
+      } else if (CONTROL.test(a.text)) {
+        attention.push(`${f.filename}:${a.line} (control character)`);
       }
     }
   }

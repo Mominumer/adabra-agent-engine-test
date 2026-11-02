@@ -272,6 +272,21 @@ test('pre-checks: hidden Unicode in a changed name, the title or the description
   assert.equal(pre([changed('a.js')], { body: 'plain caf\u00E9 \u{1F600}' }).blockers.length, 0);
 });
 
+test('pre-checks: a line break git does not count blocks, and a CRLF line or a control character does not', () => {
+  const lineOf = (text) => pre([changed('src/a.js', text)]);
+  for (const text of ['// later\rrun();', '// later\u2028run();', '// later\u2029run();']) {
+    const r = lineOf(text);
+    assert.equal(r.blockers.length, 1, JSON.stringify(text));
+    assert.match(r.blockers[0].message, /line break that git does not count/);
+    assert.doesNotMatch(r.blockers[0].message, /run\(\)/);
+  }
+  assert.deepEqual(lineOf('a line from a CRLF file\r').blockers, []);
+  const esc = lineOf('fine\u001b[2K');
+  assert.deepEqual(esc.blockers, []);
+  assert.deepEqual(esc.attention, ['src/a.js:2 (control character)']);
+  assert.deepEqual(lineOf('\tindented').attention, []);
+});
+
 test('pre-checks: a zero-width character goes on the list to read, and does not block', () => {
   for (const c of ['\u200B', '\u200D', '\u2060', '\uFEFF']) {
     const r = pre([changed('src/a.js', `q${c}`)]);
@@ -294,7 +309,7 @@ test('pre-checks: a changed file GitHub will not show blocks, unless there is no
 });
 
 test('pre-checks: the sensitive paths go on the list to read', () => {
-  const sensitive = ['reviewer/main.js', 'service/x.sh', 'coordinator/a.js', 'night/runner.js', 'ops/main.js', 'shared/stop.js', 'helper/claims.js', 'Service/x.sh', 'NIGHT/runner.js', 'Package.json', 'Test/a.js', '.github/workflows/ci.yml', '.claude/settings.json', 'sub/.claude/x', 'CLAUDE.md', 'sub/claude.local.md', 'AGENTS.md', '.mcp.json', 'package.json', 'web/package.json', 'package-lock.json', 'yarn.lock', 'pnpm-lock.yaml', 'test/a.js', 'src/tests/a.js', 'src/__tests__/a.js', 'src/a.test.js', 'src/a.spec.ts'];
+  const sensitive = ['reviewer/main.js', 'service/x.sh', 'coordinator/a.js', 'night/runner.js', 'ops/main.js', 'shared/stop.js', 'helper/claims.js', 'backup/main.js', 'onboarding/a.js', 'node_modules/.bin/node', 'src/node_modules/x.js', '.npmrc', 'sub/.npmrc', '.yarnrc.yml', '.pnpmfile.cjs', '.envrc', '.husky/pre-commit', '.vscode/tasks.json', '.devcontainer/x.json', 'Service/x.sh', 'NIGHT/runner.js', 'Package.json', 'Test/a.js', '.github/workflows/ci.yml', '.claude/settings.json', 'sub/.claude/x', 'CLAUDE.md', 'sub/claude.local.md', 'AGENTS.md', '.mcp.json', 'package.json', 'web/package.json', 'package-lock.json', 'yarn.lock', 'pnpm-lock.yaml', 'test/a.js', 'src/tests/a.js', 'src/__tests__/a.js', 'src/a.test.js', 'src/a.spec.ts'];
   for (const name of sensitive) assert.deepEqual(pre([changed(name)]).attention, [name], name);
   for (const name of ['src/a.js', 'docs/reviewer/notes.md', 'docs/night/notes.md', 'contest/a.js', 'README.md']) assert.deepEqual(pre([changed(name)]).attention, [], name);
   assert.deepEqual(pre([changed('src/moved.js', 'x', { status: 'renamed', previous_filename: 'reviewer/moved.js' })]).attention, ['src/moved.js'], 'moving a file out still counts');

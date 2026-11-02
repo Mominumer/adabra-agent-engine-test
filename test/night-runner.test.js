@@ -541,6 +541,85 @@ suite('the overnight runner', { concurrency: AT_ONCE }, () => {
     }
   });
 
+  test('approval withdrawn while publishing: looked for again before the push and before the PR', needsGit, async (t) => {
+    for (const [name, change] of Object.entries(withdrawals)) {
+      for (const [step, branches] of [['prepare', 0], ['push', 0], ['pull', 1]]) {
+        await t.test(`${name}, at ${step}`, async (tt) => {
+          const { s, open } = await setUp(tt);
+          const r = open();
+          r.onStep = (at) => {
+            if (at === step) change(s);
+          };
+          const result = await r.attempt(21, { once: true });
+          assert.equal(result.outcome, 'approval_withdrawn');
+          assert.deepEqual(s.world.pulls, []);
+          assert.equal(s.remoteBranches().length, branches);
+          assert.equal(result.record.pushed === true, branches === 1, 'the report can say a branch may remain');
+          assertNoLeftovers(s);
+        });
+      }
+    }
+  });
+
+  test('a stop and a resume since the run began still end it, and one from before it does not', needsGit, async (t) => {
+    const stopFileSays = (s, resumedAt) => writeFileSync(s.stopFile, JSON.stringify({ stopped: false, last_stop: { since: new Date(resumedAt - 1000).toISOString(), resumed_at: new Date(resumedAt).toISOString(), reason: 'a drill' } }));
+    await t.test('during this run', async (tt) => {
+      const { s, open } = await setUp(tt);
+      const r = open();
+      r.onStep = (step) => {
+        if (step === 'prepare') stopFileSays(s, s.clock() + 1000);
+      };
+      const result = await r.attempt(21, { once: true });
+      assert.equal(result.outcome, 'stopped');
+      assert.deepEqual(s.remoteBranches(), []);
+      assert.deepEqual(s.world.pulls, []);
+    });
+    await t.test('before this run', async (tt) => {
+      const { s, open } = await setUp(tt);
+      stopFileSays(s, s.clock() - 1000);
+      const result = await open().attempt(21, { once: true });
+      assert.equal(result.outcome, 'published');
+    });
+  });
+
+  test('told to stop by a signal: no session is started after it, and one that is running goes', async (t) => {
+    await t.test('before the containers', async (tt) => {
+      const { s, open } = await setUp(tt);
+      const r = open();
+      r.onStep = (step) => {
+        if (step === 'containers') void r.abort();
+      };
+      const result = await r.attempt(21, { once: true });
+      assert.equal(result.outcome, 'aborted');
+      assert.equal(sessionRuns(s).length, 0);
+      assert.equal(r.ledger.get(EVENT).outcome, 'aborted', 'the attempt counts');
+      assert.equal(postedWords(s).at(-1), statusOf('interrupted'));
+      assertNoLeftovers(s);
+    });
+    await t.test('before the ledger: nothing is spent', async (tt) => {
+      const { s, open } = await setUp(tt);
+      const r = open();
+      r.onStep = (step) => {
+        if (step === 'pin') void r.abort();
+      };
+      const result = await r.attempt(21, { once: true });
+      assert.deepEqual([result.started, result.why], [false, 'aborted']);
+      assert.equal(r.ledger.get(EVENT), null);
+      assert.equal(sessionRuns(s).length, 0);
+    });
+    await t.test('run-once, with a session running', async (tt) => {
+      const { s } = await setUp(tt);
+      s.setDocker({ sessionHangs: true });
+      const ended = new AbortController();
+      const c = command(s, { signal: ended.signal, onStep: (name) => { if (name === 'watch') setTimeout(() => ended.abort(), 20); } });
+      assert.equal(await runOnceCommand(c.options), 1);
+      assert.ok(c.say.some((l) => l.includes('the runner was told to stop')));
+      assert.equal(sessionRuns(s).length, 1);
+      assert.ok(s.calls().some((call) => call.args[0] === 'kill'));
+      assertNoLeftovers(s);
+    });
+  });
+
   test('GitHub unreadable during a run does not end it, and it cannot publish until the reads work again', needsGit, async (t) => {
     const { s, open } = await setUp(t);
     const r = open();

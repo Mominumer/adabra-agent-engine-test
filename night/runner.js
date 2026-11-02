@@ -105,7 +105,7 @@ class CouldNotStart extends Error {
 const closingCheckpoint = (outcome) => {
   if (outcome === 'published') return 'finished';
   if (outcome === 'claim_lost') return null; // it is not ours to write on any more
-  return outcome === 'stopped' || outcome === 'crashed' || outcome === 'interrupted' ? 'interrupted' : 'ended';
+  return outcome === 'stopped' || outcome === 'aborted' || outcome === 'crashed' || outcome === 'interrupted' ? 'interrupted' : 'ended';
 };
 
 export class NightRunner {
@@ -130,6 +130,7 @@ export class NightRunner {
     this.active = null;
     this.swept = false;
     this.lastNote = null;
+    this.aborted = false;
   }
 
   close() {
@@ -145,7 +146,11 @@ export class NightRunner {
   }
 
   #guardStop() {
-    if (this.stopNow().stopped) throw new Halt('stopped');
+    if (this.aborted) throw new Halt('aborted');
+    const stop = this.stopNow();
+    if (stop.stopped) throw new Halt('stopped');
+    // A stop and a resume since this run began still end it, though nothing here was looking at the time: a long fetch can span both.
+    if (this.active && Date.parse(stop.last_stop?.resumed_at) >= this.active.startedAt) throw new Halt('stopped');
   }
 
   async #step(name) {
@@ -379,7 +384,7 @@ export class NightRunner {
         },
       };
     } catch (err) {
-      const why = err instanceof Halt ? 'stopped' : err instanceof CouldNotStart ? err.why : 'internal_error';
+      const why = err instanceof Halt ? (err.outcome === 'aborted' ? 'aborted' : 'stopped') : err instanceof CouldNotStart ? err.why : 'internal_error';
       this.#noteCouldNotStart(why);
       if (held) await this.settle();
       return { started: false, why };
@@ -413,7 +418,7 @@ export class NightRunner {
     await this.#step('watch');
     const first = await Promise.race([run.session.ended, run.watcher.halted]);
     if (run.watcher.outcome) await this.#haltedSession(run);
-    if (first.closed) throw new Halt('session_failed');
+    if (first.closed) throw new Halt(this.aborted ? 'aborted' : 'session_failed');
 
     await this.#step('export');
     const exported = await this.#exportDiff(run);
@@ -468,6 +473,7 @@ export class NightRunner {
       this.#guardStop();
       await sleep(Math.min(100, this.t.stopPollMs));
     }
+    this.#guardStop(); // with no wait between here and the spawn, abort() either sees this session or stops it being started
     const credential = readCredential(this.s.credentialFile);
     if (!credential) throw new Halt('session_failed');
 
@@ -673,9 +679,10 @@ export class NightRunner {
     }
   }
 
+  // A fetch can take minutes, so a stop, a lost lease or a withdrawn approval is looked for again before each thing that goes public.
   async #publishGate(run, stage) {
     await this.#step(stage);
-    if (stage === 'push' && await this.#renew(run) !== 'ok') throw new PublishHold();
+    if (stage !== 'prepare' && await this.#finalGate(run) !== 'go') throw new PublishHold();
   }
 
   // --- the end of a run ---
@@ -724,7 +731,7 @@ export class NightRunner {
       run.record.checks = await this.#checkStates(run.record.commit);
       this.records.write(run.record);
       const open = Object.values(run.record.checks).some((s) => s === 'pending' || s === 'none');
-      if (!open || this.clock() >= until || this.stopNow().stopped) return;
+      if (!open || this.clock() >= until || this.aborted || this.stopNow().stopped) return;
       await sleep(this.t.checksPollMs);
     }
   }
@@ -784,7 +791,7 @@ export class NightRunner {
     for (const number of numbers) {
       const result = await this.attempt(number);
       if (result.started) return result;
-      if (result.why === 'stopped' || result.why === 'coordinator_down' || result.why === 'github_down' || result.why === 'internal_error') return result;
+      if (result.why === 'stopped' || result.why === 'aborted' || result.why === 'coordinator_down' || result.why === 'github_down' || result.why === 'internal_error') return result;
     }
     return null;
   }
@@ -819,8 +826,9 @@ export class NightRunner {
     }
   }
 
-  // The service was told to stop, in the middle of a run. Whatever is running goes now. The next start settles the rest.
+  // The runner was told to stop, by a signal. Whatever is running goes now, and nothing further starts. The next start settles the rest.
   async abort() {
+    this.aborted = true;
     if (this.active?.containers) await this.#docker(['kill', this.active.names.session, this.active.names.tunnel], { timeoutMs: KILL_MS });
   }
 }

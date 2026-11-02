@@ -1,13 +1,16 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { createServer } from 'node:net';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  GIT_IDENTITY, PublishHold, WRITE_PERMISSIONS, branchName, commitMessage, gitEnvironment, publish, pullBody, pullTitle, readReviewDecision, readYourself,
+  GIT_IDENTITY, PublishHold, WRITE_PERMISSIONS, branchName, commitMessage, gitEnvironment, gitRunner, publish, pullBody, pullTitle, readReviewDecision, readYourself,
 } from '../night/publish.js';
 import { parseTaskId } from '../reviewer/task-results.js';
 import { preCheck } from '../reviewer/precheck.js';
+import { runCommand } from '../night/containers.js';
 import { READ_PERMISSIONS, appAuth, nightSettings } from '../night/settings.js';
 import { validateDiff } from '../night/validate.js';
 import { makeStack, needsGit, realDiff } from './fixtures/night-stack.js';
@@ -292,6 +295,33 @@ test('settings that are missing fail loudly: there is no publishing without the 
   assert.throws(() => appAuth({ env: { ...env, NIGHT_APP_ID: '1' }, settings, permissions: WRITE_PERMISSIONS }), /incomplete/);
   rmSync(s.env.NIGHT_APP_KEY_FILE);
   assert.throws(() => appAuth({ env: s.env, settings, permissions: WRITE_PERMISSIONS }), /cannot be read/);
+});
+
+test('a time limit holds even when a process the command started keeps its pipes open', async () => {
+  const started = Date.now();
+  const r = await runCommand('sh', ['-c', 'sleep 5 & wait'], { timeoutMs: 100 });
+  assert.equal(r.code, -1);
+  assert.equal(r.timedOut, true);
+  assert.ok(Date.now() - started < 3000, 'it did not wait for the process that was left');
+});
+
+test('real git: a server that accepts and then says nothing cannot hold up a fetch past its time limit', needsGit, async (t) => {
+  const silent = createServer(() => {});
+  await new Promise((resolve) => {
+    silent.listen(0, '127.0.0.1', resolve);
+  });
+  t.after(() => {
+    silent.close();
+  });
+  const dir = mkdtempSync(join(tmpdir(), 'adabra-night-silent-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const gitUrl = `http://127.0.0.1:${silent.address().port}/x.git`;
+  const git = gitRunner({ gitCommand: 'git', env: gitEnvironment({ dir, gitUrl }) });
+  assert.equal((await git(['init', '-q', '--bare', '--template='])).code, 0);
+  const started = Date.now();
+  const r = await git(['fetch', '-q', gitUrl, SHA], { timeoutMs: 300 });
+  assert.equal(r.code, -1);
+  assert.ok(Date.now() - started < 5000, 'held up for longer than its limit');
 });
 
 test('a real push from the no-working-tree repository leaves a commit git itself finds sound', needsGit, async (t) => {
