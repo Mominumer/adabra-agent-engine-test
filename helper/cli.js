@@ -12,7 +12,8 @@
 //   node helper/cli.js flush
 //   node helper/cli.js status
 //
-// State lives in $TEAM_AGENT_HOME (default ~/.team-agent): config.json, token (mode 600), outbox.db
+// State lives in $TEAM_AGENT_HOME (default ~/.team-agent): config.json, token (mode 600; on Windows, the folder's
+// access list: see the README), outbox.db
 import { execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
@@ -23,6 +24,7 @@ import { Outbox } from './outbox.js';
 import { flush } from './sender.js';
 import { validateEvent } from '../shared/event.js';
 import { ClaimFile, claimRefusal, claimTask, heartbeat, listTasks, newRunId, releaseClaim } from './claims.js';
+import { readSecretFile, tokenSaveHint } from './platform.js';
 
 const home = process.env.TEAM_AGENT_HOME ?? join(homedir(), '.team-agent');
 const configPath = join(home, 'config.json');
@@ -38,7 +40,7 @@ const git = (...a) => {
 
 function loadConfig() {
   const config = JSON.parse(readFileSync(configPath, 'utf8'));
-  const token = readFileSync(tokenPath, 'utf8').trim();
+  const token = readSecretFile(tokenPath);
   return { ...config, token };
 }
 
@@ -54,7 +56,7 @@ if (cmd === 'enroll') {
   mkdirSync(home, { recursive: true, mode: 0o700 });
   writeFileSync(configPath, JSON.stringify({ coordinator_url: url, device_id: deviceId }, null, 2));
   console.log(`saved ${configPath}. Now save the device token (from the coordinator's device-add) to ${tokenPath}:`);
-  console.log(`  umask 077 && pbpaste > "${tokenPath}"   # macOS: copy the token first`);
+  console.log(tokenSaveHint(tokenPath));
 } else if (cmd === 'tasks') {
   const cfg = loadConfig();
   const r = await listTasks({ url: cfg.coordinator_url, deviceId: cfg.device_id, token: cfg.token });
