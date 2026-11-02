@@ -17,6 +17,12 @@
 //   REVIEW_IMAGE         sandbox image, pulled beforehand (default node:26-slim; pin by digest)
 //   REVIEW_TEST_CMD      command run on the PR inside the sandbox (default: npm test)
 //   REVIEW_TIMEOUT_MS    per-job limit (default 900000 = 15 min)
+//
+// Telling the coordinator how a task's review went (off unless the device identity is set; reviews run the same either way):
+//   REVIEW_DEVICE_ID          this reviewer's enrolled device, role reviewer (coordinator: device-add <id> reviewer)
+//   REVIEW_DEVICE_TOKEN_FILE  that device's token (default ~/.adabra/reviewer-device-token), not any GitHub token
+//   REVIEW_COORDINATOR_URL    https, or http to this machine (e.g. http://127.0.0.1:8787)
+//   REVIEW_DELIVERY_MS        how often to send what is due (default 5000)
 import { readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
@@ -25,6 +31,7 @@ import { ReviewGitHub } from './github.js';
 import { Dispatcher } from './dispatcher.js';
 import { mockReview } from './review-mock.js';
 import { Sandbox, selfCheck } from './sandbox.js';
+import { startTaskResults } from './task-results.js';
 
 const log = (m) => console.log(`${new Date().toISOString()} ${m}`);
 const [cmd, ...args] = process.argv.slice(2);
@@ -55,19 +62,19 @@ function github() {
   };
 }
 
-function dispatcher() {
+function dispatcher({ linkTasks = false } = {}) {
   const authors = (process.env.REVIEW_AUTHORS ?? '').split(',').map((s) => s.trim()).filter(Boolean);
   if (!authors.length) throw new Error('REVIEW_AUTHORS is empty: list the GitHub logins allowed to run code on the mini');
   const gh = github();
   return new Dispatcher({
-    store, github: gh, repo: process.env.GITHUB_REPO, authors, log,
+    store, github: gh, repo: process.env.GITHUB_REPO, authors, log, linkTasks,
     runTests: sandbox.testRunner(gh),
     runReview: mockReview(gh), // later: the real Claude review skill, same contract
   });
 }
 
 if (cmd === 'serve') {
-  const d = dispatcher();
+  const d = dispatcher({ linkTasks: startTaskResults({ store, log }).linkTasks });
   const pollMs = Number(process.env.REVIEW_POLL_MS ?? 60_000);
   const stale = await sandbox.cleanup();
   if (stale) log(`removed ${stale} sandbox container(s) left by a previous run`);
@@ -90,6 +97,11 @@ if (cmd === 'serve') {
   for (const j of store.recent(10)) {
     const res = j.result ? `tests ${j.result.tests}, review ${j.result.review}` : (j.last_error ?? '');
     console.log(`PR #${j.pr} ${j.sha.slice(0, 12)} ${j.state} (attempts ${j.attempts}) ${res}`);
+  }
+  const results = store.taskResultCounts();
+  if (Object.keys(results).length) console.log('task results:', results);
+  for (const r of store.undeliveredTaskResults()) {
+    console.log(`${r.task_id} PR #${r.pr} ${r.sha.slice(0, 12)} ${r.status} (attempts ${r.attempts}) ${r.last_error ?? ''}`);
   }
 } else if (cmd === 'sandbox-check') {
   const r = await selfCheck(sandbox);

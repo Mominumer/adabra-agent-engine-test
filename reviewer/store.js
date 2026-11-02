@@ -8,6 +8,7 @@ export class ReviewStore {
   constructor(path) {
     this.db = new DatabaseSync(path);
     this.db.exec(`
+      PRAGMA busy_timeout = 5000;
       PRAGMA journal_mode = WAL;
       PRAGMA synchronous = FULL;
       CREATE TABLE IF NOT EXISTS jobs (
@@ -26,7 +27,40 @@ export class ReviewStore {
         pr INTEGER PRIMARY KEY,
         comment_id INTEGER
       );
+      -- Results waiting to reach the coordinator. A new table, so a live database needs nothing else to upgrade, and
+      -- reviews finished before this existed are never sent.
+      CREATE TABLE IF NOT EXISTS task_results (
+        result_id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL,
+        pr INTEGER NOT NULL,
+        sha TEXT NOT NULL,
+        payload TEXT NOT NULL,             -- the exact JSON sent; re-sent unchanged until acknowledged
+        status TEXT NOT NULL DEFAULT 'pending', -- pending | acked | rejected
+        attempts INTEGER NOT NULL DEFAULT 0,
+        next_attempt_at INTEGER NOT NULL DEFAULT 0,
+        last_error TEXT,
+        created_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS task_results_due ON task_results (status, next_attempt_at);
     `);
+  }
+
+  #tx(fn) {
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const r = fn();
+      this.db.exec('COMMIT');
+      return r;
+    } catch (err) {
+      this.db.exec('ROLLBACK');
+      throw err;
+    }
+  }
+
+  #addTaskResult(r) {
+    this.db
+      .prepare('INSERT INTO task_results (result_id, task_id, pr, sha, payload, created_at) VALUES (?, ?, ?, ?, ?, ?)')
+      .run(r.result_id, r.task_id, r.pr, r.sha, JSON.stringify(r), r.reviewed_at);
   }
 
   // Returns true only the first time this (pr, sha) is seen.
@@ -52,20 +86,71 @@ export class ReviewStore {
     this.db.prepare("UPDATE jobs SET state = 'running', attempts = attempts + 1 WHERE pr = ? AND sha = ?").run(pr, sha);
   }
 
-  markDone(pr, sha, result) {
-    this.db
-      .prepare("UPDATE jobs SET state = 'done', result = ?, last_error = NULL WHERE pr = ? AND sha = ?")
-      .run(JSON.stringify(result), pr, sha);
+  // One transaction with the job, so a crash cannot leave a finished review whose result for the task is lost.
+  markDone(pr, sha, result, taskResult = null) {
+    this.#tx(() => {
+      this.db
+        .prepare("UPDATE jobs SET state = 'done', result = ?, last_error = NULL WHERE pr = ? AND sha = ?")
+        .run(JSON.stringify(result), pr, sha);
+      if (taskResult) this.#addTaskResult(taskResult);
+    });
   }
 
   // Back to the queue with backoff, or 'failed' after MAX_ATTEMPTS. Returns true when it gave up.
-  markRetry(pr, sha, error, now) {
-    const { attempts } = this.db.prepare('SELECT attempts FROM jobs WHERE pr = ? AND sha = ?').get(pr, sha);
-    const dead = attempts >= MAX_ATTEMPTS;
+  // taskResultIfDead is asked for a result to save with the job only when it gave up.
+  markRetry(pr, sha, error, now, taskResultIfDead = () => null) {
+    return this.#tx(() => {
+      const { attempts } = this.db.prepare('SELECT attempts FROM jobs WHERE pr = ? AND sha = ?').get(pr, sha);
+      const dead = attempts >= MAX_ATTEMPTS;
+      this.db
+        .prepare('UPDATE jobs SET state = ?, next_attempt_at = ?, last_error = ? WHERE pr = ? AND sha = ?')
+        .run(dead ? 'failed' : 'queued', now + Math.min(600_000, 5000 * 2 ** attempts), String(error).slice(0, 500), pr, sha);
+      const taskResult = dead ? taskResultIfDead() : null;
+      if (taskResult) this.#addTaskResult(taskResult);
+      return dead;
+    });
+  }
+
+  // --- results for the coordinator ----------------------------------------
+  // Oldest first. The coordinator decides what is stale, so order here is only a courtesy.
+  dueTaskResults(now) {
+    return this.db
+      .prepare("SELECT * FROM task_results WHERE status = 'pending' AND next_attempt_at <= ? ORDER BY created_at, rowid")
+      .all(now);
+  }
+
+  ackTaskResult(resultId) {
+    this.db.prepare("UPDATE task_results SET status = 'acked', last_error = NULL WHERE result_id = ?").run(resultId);
+  }
+
+  rejectTaskResult(resultId, error) {
+    this.db.prepare("UPDATE task_results SET status = 'rejected', last_error = ? WHERE result_id = ?").run(String(error).slice(0, 500), resultId);
+  }
+
+  // Stays pending however long the coordinator is away; only the wait between attempts is capped.
+  retryTaskResult(resultId, error, now) {
+    const { attempts } = this.db.prepare('SELECT attempts FROM task_results WHERE result_id = ?').get(resultId);
     this.db
-      .prepare('UPDATE jobs SET state = ?, next_attempt_at = ?, last_error = ? WHERE pr = ? AND sha = ?')
-      .run(dead ? 'failed' : 'queued', now + Math.min(600_000, 5000 * 2 ** attempts), String(error).slice(0, 500), pr, sha);
-    return dead;
+      .prepare('UPDATE task_results SET attempts = ?, next_attempt_at = ?, last_error = ? WHERE result_id = ?')
+      .run(attempts + 1, now + Math.min(300_000, 1000 * 2 ** (attempts + 1)), String(error).slice(0, 500), resultId);
+  }
+
+  getTaskResult(resultId) {
+    const row = this.db.prepare('SELECT * FROM task_results WHERE result_id = ?').get(resultId);
+    return row ? { ...row, payload: JSON.parse(row.payload) } : null;
+  }
+
+  taskResultCounts() {
+    return Object.fromEntries(
+      this.db.prepare('SELECT status, COUNT(*) AS n FROM task_results GROUP BY status').all().map((r) => [r.status, r.n]),
+    );
+  }
+
+  // Newest first, leaving out the ones delivered: what an operator may need to act on.
+  undeliveredTaskResults(limit = 10) {
+    return this.db
+      .prepare("SELECT task_id, pr, sha, status, attempts, last_error FROM task_results WHERE status != 'acked' ORDER BY created_at DESC LIMIT ?")
+      .all(limit);
   }
 
   // After a crash or restart, anything left 'running' never finished: run it again.

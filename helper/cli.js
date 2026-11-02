@@ -2,7 +2,8 @@
 // Local helper (runs on each builder laptop).
 //
 //   node helper/cli.js enroll <coordinator-url> <device-id>   (then put the token in $TEAM_AGENT_HOME/token)
-//   node helper/cli.js tasks                         (what you can work on: reserved for you first, then open ones)
+//   node helper/cli.js tasks                         (what you can work on, returned to you by a failed review first,
+//                                                     then reserved for you, then open ones; with each task's latest review)
 //   node helper/cli.js claim TASK-1                  (exclusive lease; needs the coordinator)
 //   node helper/cli.js claim-next                    (claims the first available task from that list)
 //   node helper/cli.js heartbeat TASK-1              (keeps the lease alive; stops if the claim is lost)
@@ -23,7 +24,7 @@ import { parseArgs } from 'node:util';
 import { Outbox } from './outbox.js';
 import { flush } from './sender.js';
 import { validateEvent } from '../shared/event.js';
-import { ClaimFile, claimRefusal, claimTask, heartbeat, listTasks, newRunId, releaseClaim } from './claims.js';
+import { ClaimFile, claimRefusal, claimTask, describeTask, heartbeat, listTasks, newRunId, releaseClaim } from './claims.js';
 import { readSecretFile, tokenSaveHint } from './platform.js';
 
 const home = process.env.TEAM_AGENT_HOME ?? join(homedir(), '.team-agent');
@@ -65,10 +66,7 @@ if (cmd === 'enroll') {
     process.exit(1);
   }
   if (!r.data.tasks.length) console.log('no open tasks for you');
-  for (const t of r.data.tasks) {
-    const who = t.state === 'yours' ? 'you hold it' : t.state === 'busy' ? `held by ${t.held_by}` : 'available';
-    console.log(`${t.task_id} (#${t.issue}) ${t.reserved_for_you ? '[reserved for you] ' : ''}${who}${t.title ? ` - ${t.title}` : ''}`);
-  }
+  for (const t of r.data.tasks) console.log(describeTask(t));
 } else if (cmd === 'claim' || cmd === 'claim-next') {
   const cfg = loadConfig();
   const auth = { url: cfg.coordinator_url, deviceId: cfg.device_id, token: cfg.token };

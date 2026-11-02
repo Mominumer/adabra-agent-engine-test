@@ -1,7 +1,10 @@
 import { REVIEW_MARKER } from './github.js';
+import { buildResult, parseTaskId } from './task-results.js';
+import { fence, quiet } from '../shared/sanitize.js';
 
 export const CONTEXTS = { tests: 'adabra/tests', review: 'adabra/review' };
 const STATES = new Set(['success', 'failure', 'error']);
+const GAVE_UP = 'Review could not run; ask the operator (reviewer retry)';
 
 // A step result is trusted only if it is well formed; anything else (missing, crashed, garbage) counts as an error.
 // A check is never 'success' by default.
@@ -17,10 +20,6 @@ export function normalize(r, step) {
     reviewer: r.reviewer ? String(r.reviewer).slice(0, 40) : null,
   };
 }
-
-// Text that came from the PR or the sandbox is untrusted: no @mentions (they notify people), no breaking out of code blocks.
-const quiet = (s) => String(s).replace(/@/g, '@​');
-const fence = (s) => String(s).replace(/```/g, "'''");
 
 export function renderComment(job, tests, review) {
   const icon = { success: 'pass', failure: 'FAIL', error: 'ERROR' };
@@ -50,8 +49,9 @@ export function renderComment(job, tests, review) {
 }
 
 export class Dispatcher {
-  constructor({ store, github, repo, authors, runTests, runReview, now = () => Date.now(), log = () => {} }) {
-    Object.assign(this, { store, github, repo, runTests, runReview, now, log });
+  // linkTasks: queue a result for the coordinator when a job belongs to a task. Off when this reviewer has no device identity.
+  constructor({ store, github, repo, authors, runTests, runReview, now = () => Date.now(), log = () => {}, linkTasks = false }) {
+    Object.assign(this, { store, github, repo, runTests, runReview, now, log, linkTasks });
     this.authors = new Set(authors);
     this.skipped = new Set(); // log each skipped PR commit once, not every poll
   }
@@ -105,16 +105,33 @@ export class Dispatcher {
     } catch (err) {
       return this.#retry(job, `github: ${err.message}`, null);
     }
-    this.store.markDone(job.pr, job.sha, { tests: tests.state, review: review.state });
+    // Only now, with the statuses posted: the job and its result for the task are saved together, or not at all.
+    this.store.markDone(job.pr, job.sha, { tests: tests.state, review: review.state }, this.#taskResult(job, tests, review));
     this.log(`PR #${job.pr} ${job.sha.slice(0, 12)} done: tests ${tests.state}, review ${review.state}`);
     return { pr: job.pr, sha: job.sha, tests: tests.state, review: review.state };
   }
 
+  // What to tell the coordinator about this job, or null. Never throws: nothing about the task link may disturb a review.
+  #taskResult(job, tests, review) {
+    if (!this.linkTasks) return null;
+    try {
+      const { task_id: taskId, why } = parseTaskId(job.meta);
+      if (why) this.log(`PR #${job.pr} ${job.sha.slice(0, 12)} not linked to a task: ${why}`);
+      return taskId ? buildResult({ taskId, job, tests, review, now: this.now() }) : null;
+    } catch (err) {
+      this.log(`PR #${job.pr} ${job.sha.slice(0, 12)} task result not prepared: ${err.message}`);
+      return null;
+    }
+  }
+
   async #retry(job, error, statusText) {
-    const dead = this.store.markRetry(job.pr, job.sha, error, this.now());
+    // Giving up is an outcome the task should hear about too, or it goes on showing the verdict on an older commit.
+    // The reason stays here: it is machinery detail, and the task's comment is public.
+    const gaveUp = { state: 'error', summary: GAVE_UP, findings: [], reviewer: null };
+    const dead = this.store.markRetry(job.pr, job.sha, error, this.now(), () => this.#taskResult(job, gaveUp, gaveUp));
     this.log(`PR #${job.pr} ${job.sha.slice(0, 12)} ${dead ? 'FAILED for good' : 'will retry'}: ${error}`);
     if (statusText) {
-      const text = dead ? 'Review could not run; ask the operator (reviewer retry)' : statusText;
+      const text = dead ? GAVE_UP : statusText;
       for (const ctx of Object.values(CONTEXTS)) {
         await this.github.setStatus(job.sha, ctx, 'error', text).catch(() => {});
       }
