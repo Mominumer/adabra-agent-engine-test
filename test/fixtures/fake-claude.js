@@ -10,8 +10,21 @@
 //   sleepMs    wait this long first
 //   flood      print this many bytes instead of a result
 //   killSelf   die by SIGKILL
+//   answers    { <commit>: structured_output }, for a test answering many commits from one file
+// A sha of FROM-PROMPT in an answer becomes the commit named in the prompt, for a test that cannot know it in advance.
+// With --output-format stream-json it prints lines, as the real one does: the init line, what the model said, then the result.
+//   init       fields laid over the init line
+//   noInit     leave the init line out
+//   text       what the model says
+//   lines      more lines (objects) to print before the result
+//   loaded     a file in the job, whose text the model repeats with no tool having given it: as if the CLI had loaded it as configuration
+//   readAsData the same, but after a tool result gave it to the model
+//   copyPlanted answers with the review.json the PR planted in its tree
+//   obey       plays a review whose limits have all failed. It does what the job's pr.json asks, as far as this user's permissions go: reads
+//              the paths listed there into a finding, fetches the URLs there, runs the hooks and server in ./.claude/settings.json and ./.mcp.json
 // FAKE_CLAUDE_RECORD is a file that gets one JSON line per run: its arguments, directory and environment.
-import { appendFileSync, readFileSync } from 'node:fs';
+import { execSync, spawnSync } from 'node:child_process';
+import { appendFileSync, existsSync, readdirSync, readFileSync } from 'node:fs';
 
 const args = process.argv.slice(2);
 if (args.includes('--version')) {
@@ -32,8 +45,41 @@ if (process.env.FAKE_CLAUDE_RECORD) {
     configDir: process.env.CLAUDE_CONFIG_DIR ?? null,
     home: process.env.HOME ?? null,
     sha,
+    files: readdirSync('.', { recursive: true }).sort(),
   })}\n`);
 }
+
+const streaming = args[args.indexOf('--output-format') + 1] === 'stream-json';
+let obeyed = null;
+
+// Everything here is against the test's own temp files and listener: there is still nothing to call.
+async function obey() {
+  const pr = JSON.parse(readFileSync('pr.json', 'utf8'));
+  const stolen = [];
+  for (const [, path] of pr.body.matchAll(/^- (\S+)$/gm)) {
+    try {
+      stolen.push(readFileSync(path, 'utf8').trim());
+    } catch {
+      stolen.push(`could not read ${path}`);
+    }
+  }
+  if (existsSync('.claude/settings.json')) {
+    const { hooks } = JSON.parse(readFileSync('.claude/settings.json', 'utf8'));
+    execSync(hooks.SessionStart[0].hooks[0].command);
+  }
+  if (existsSync('.mcp.json')) {
+    const server = JSON.parse(readFileSync('.mcp.json', 'utf8')).mcpServers['adabra-live-command'];
+    spawnSync(server.command, server.args);
+  }
+  for (const [url] of pr.body.matchAll(/http:\/\/127\.0\.0\.1:\d+\/(?=\s)/g)) await fetch(url).catch(() => {});
+  obeyed = {
+    verdict: 'pass',
+    sha,
+    findings: [{ file: null, line: null, severity: 'minor', message: stolen.join(' ').slice(0, 500) }],
+  };
+}
+
+const withSha = (answer) => (answer?.sha === 'FROM-PROMPT' ? { ...answer, sha } : answer);
 
 function result() {
   const r = {
@@ -46,19 +92,33 @@ function result() {
     num_turns: 4,
     duration_ms: 1234,
     modelUsage: { 'claude-sonnet-5-5': { inputTokens: 10, outputTokens: 5 } },
-    structured_output: control.output ?? { verdict: 'pass', sha, findings: [] },
+    structured_output: obeyed ?? withSha(control.answers?.[sha] ?? control.output) ?? { verdict: 'pass', sha, findings: [] },
     ...control.result,
   };
   for (const key of control.drop ?? []) delete r[key];
   return JSON.stringify(r);
 }
 
+function streamed() {
+  const init = {
+    type: 'system', subtype: 'init', cwd: process.cwd(), session_id: 'fake', model: 'claude-sonnet-5-5', permissionMode: 'dontAsk',
+    tools: ['Read', 'Grep', 'Glob', 'StructuredOutput'], mcp_servers: [], ...control.init,
+  };
+  const inJob = (name) => (name && existsSync(name) ? readFileSync(name, 'utf8') : '');
+  const said = { type: 'assistant', message: { content: [{ type: 'text', text: `${control.text ?? 'free text from the model'} ${inJob(control.loaded)}${inJob(control.readAsData)}` }] } };
+  const given = control.readAsData ? [{ type: 'user', message: { content: [{ type: 'tool_result', content: inJob(control.readAsData) }] } }] : [];
+  const lines = [...(control.noInit ? [] : [init]), ...given, said, ...(control.lines ?? [])];
+  return `${lines.map((l) => JSON.stringify(l)).join('\n')}\n${result()}\n`;
+}
+
 const finish = () => {
   if (control.killSelf) process.kill(process.pid, 'SIGKILL');
   if (control.stderr) process.stderr.write(control.stderr);
-  const out = control.flood ? 'x'.repeat(control.flood) : (control.stdout ?? result());
+  const out = control.flood ? 'x'.repeat(control.flood) : (control.stdout ?? (streaming ? streamed() : result()));
   process.stdout.write(out, () => process.exit(control.exit ?? 0));
 };
 
+if (control.obey) await obey();
+if (control.copyPlanted) obeyed = JSON.parse(readFileSync('tree/review.json', 'utf8'));
 if (control.sleepMs) setTimeout(finish, control.sleepMs);
 else finish();

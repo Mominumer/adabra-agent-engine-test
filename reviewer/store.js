@@ -3,6 +3,7 @@ import { DatabaseSync } from 'node:sqlite';
 export const MAX_ATTEMPTS = 5;
 const PAUSE_FIRST_MS = 60 * 60_000;
 const PAUSE_MAX_MS = 6 * 60 * 60_000;
+export const CHECK_PR_BASE = 900_000_000; // PR numbers from here up are made up by the check tools: no real PR gets near this
 
 const utcDay = (t) => new Date(t).toISOString().slice(0, 10);
 
@@ -256,6 +257,20 @@ export class ReviewStore {
 
   reviewRuns(pr, sha) {
     return this.db.prepare('SELECT * FROM review_runs WHERE pr = ? AND sha = ? ORDER BY id').all(pr, sha);
+  }
+
+  // Real reviews so far, as counts and the CLI's estimates: never what a review said. The live check's rows have made-up PR numbers and
+  // are left out, though they do count towards the day's cap.
+  reviewRunTotals() {
+    const totals = this.db
+      .prepare(`SELECT COUNT(*) AS runs, COUNT(DISTINCT sha) AS commits, SUM(cost_usd) AS cost, SUM(num_turns) AS turns, SUM(duration_ms) AS ms
+        FROM review_runs WHERE pr < ?`)
+      .get(CHECK_PR_BASE);
+    const groups = this.db
+      .prepare(`SELECT COALESCE(outcome, 'unfinished') AS outcome, CASE WHEN json_valid(result) THEN json_extract(result, '$.state') END AS state, COUNT(*) AS n
+        FROM review_runs WHERE pr < ? GROUP BY 1, 2`)
+      .all(CHECK_PR_BASE);
+    return { ...totals, groups };
   }
 
   // --- the pause on real reviews -------------------------------------------
