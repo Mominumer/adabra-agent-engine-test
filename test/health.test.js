@@ -574,6 +574,27 @@ test('real probes: a stuck database reader becomes a line, and so does a reader 
   assert.equal(line.level, 'FAIL');
 });
 
+test('real probes: Tailscale is told to act as a command-line tool, which launchd\'s bare environment would not make it', async () => {
+  const seen = [];
+  const tool = async (file, args, options) => {
+    seen.push({ file, args, env: options.env });
+    return { code: 0, stdout: '{"BackendState":"Running"}' };
+  };
+  const env = { PATH: '/nonexistent', ADABRA_TAILSCALE: '/fake/Tailscale' };
+  const probes = realProbes({ env, home: tmpdir(), tool });
+  await probes.tailscaleStatus();
+  await probes.tailscaleServe();
+  assert.deepEqual(seen.map((s) => s.args[0]), ['status', 'serve']);
+  for (const s of seen) {
+    assert.equal(s.file, '/fake/Tailscale');
+    assert.equal(s.env.TAILSCALE_BE_CLI, '1');
+    assert.equal(s.env.PATH, '/nonexistent', 'the rest of the environment is unchanged');
+  }
+  assert.equal(env.TAILSCALE_BE_CLI, undefined, 'and the caller\'s environment is left alone');
+  await probes.docker();
+  assert.equal(seen.at(-1).env.TAILSCALE_BE_CLI, undefined, 'no other tool gets it');
+});
+
 // --- reading reviewer.db ------------------------------------------------------------------------------------------------
 
 function seededDb(t) {

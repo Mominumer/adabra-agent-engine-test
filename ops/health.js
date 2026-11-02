@@ -171,6 +171,8 @@ export function realProbes({ env = process.env, home = homedir(), repoDir = REPO
   const logDir = resolve(env.ADABRA_LOG_DIR?.trim() || join(home, 'Library', 'Logs'));
   const statusFile = healthStatusPath(env, home);
   const tailscale = env.ADABRA_TAILSCALE?.trim() || (existsSync(TAILSCALE_APP) ? TAILSCALE_APP : 'tailscale');
+  // Under launchd there is no TERM, and the app's binary then tries to start the GUI instead of answering.
+  const askTailscale = (args) => tool(tailscale, args, { env: { ...env, TAILSCALE_BE_CLI: '1' }, timeoutMs: TAILSCALE_MS });
   return {
     stop: () => readStop({ path: stopFilePath(env, () => home) }),
     service: async (label) => ({
@@ -199,7 +201,7 @@ export function realProbes({ env = process.env, home = homedir(), repoDir = REPO
     },
     docker: () => run('docker', ['info', '--format', '{{.ServerVersion}}'], DOCKER_MS),
     tailscaleStatus: async () => {
-      const r = await run(tailscale, ['status', '--json'], TAILSCALE_MS);
+      const r = await askTailscale(['status', '--json']);
       if (toolTrouble(r, 'tailscale', TAILSCALE_MS)) return r;
       try {
         const j = JSON.parse(r.stdout);
@@ -208,7 +210,7 @@ export function realProbes({ env = process.env, home = homedir(), repoDir = REPO
         return { code: r.code, unparsed: true };
       }
     },
-    tailscaleServe: () => run(tailscale, ['serve', 'status'], TAILSCALE_MS),
+    tailscaleServe: () => askTailscale(['serve', 'status']),
     loginPref: () => run('defaults', ['read', ...TAILSCALE_PREF], DEFAULTS_MS),
     disk: async () => {
       const s = await statfs(home);
