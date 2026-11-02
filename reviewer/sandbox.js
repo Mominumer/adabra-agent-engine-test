@@ -1,7 +1,10 @@
 import { spawn, execFile } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 import { promisify } from 'node:util';
 
 const run = promisify(execFile);
+const CLEAN_WORKER = new URL('./clean-worker.cjs', import.meta.url);
+const CLEAN_TAR_LIMIT = 100 * 1024 * 1024; // above the worker's own limits: 50 MB of files plus their headers
 
 // The untrusted half of the reviewer. PR code only ever runs inside this container:
 // no network, no host files, no secrets in its environment, not root, read-only system, limited CPU, memory,
@@ -81,19 +84,41 @@ export class Sandbox {
 
   // Runs `script` with `sh -c` inside a fresh container. Resolves { code, timedOut, log }.
   // Rejects only when the container could not be started at all.
-  exec({ name, script, args = [], input = null, timeoutMs = this.o.timeoutMs }) {
+  // With `stdoutLimit`, stdout is kept apart from the log and byte for byte (resolved as `stdout`), and going over the limit
+  // stops the container (resolved as `overflow`). Otherwise stdout and stderr share the log, which is text.
+  exec({ name, script, args = [], input = null, timeoutMs = this.o.timeoutMs, stdoutLimit = null }) {
     const argv = [...dockerArgs({ ...this.o, name }), 'sh', '-c', script, 'sandbox', ...args];
     return new Promise((resolve, reject) => {
       const child = spawn(this.o.docker, argv, { env: this.o.env ?? process.env, stdio: ['pipe', 'pipe', 'pipe'] });
       const tail = new Tail(this.o.maxLogBytes);
+      const out = [];
+      let outSize = 0;
       let timedOut = false;
-      child.stdout.on('data', (b) => tail.push(b));
+      let overflow = false;
+      const stop = () => {
+        execFile(this.o.docker, ['kill', name], { env: this.o.env ?? process.env }, () => {});
+        setTimeout(() => child.kill('SIGKILL'), 10_000).unref();
+      };
+      child.stdout.on('data', (b) => {
+        if (stdoutLimit === null) {
+          tail.push(b);
+          return;
+        }
+        if (overflow) return;
+        outSize += b.length;
+        if (outSize <= stdoutLimit) {
+          out.push(b);
+          return;
+        }
+        overflow = true;
+        out.length = 0;
+        stop();
+      });
       child.stderr.on('data', (b) => tail.push(b));
       child.stdin.on('error', () => {}); // the container may exit before reading all input
       const timer = setTimeout(() => {
         timedOut = true;
-        execFile(this.o.docker, ['kill', name], { env: this.o.env ?? process.env }, () => {});
-        setTimeout(() => child.kill('SIGKILL'), 10_000).unref();
+        stop();
       }, timeoutMs);
       child.on('error', (err) => {
         clearTimeout(timer);
@@ -101,11 +126,44 @@ export class Sandbox {
       });
       child.on('close', (code, signal) => {
         clearTimeout(timer);
-        resolve({ code: code ?? (signal ? 128 : -1), timedOut, log: tail.text() });
+        const result = { code: code ?? (signal ? 128 : -1), timedOut, log: tail.text() };
+        resolve(stdoutLimit === null ? result : { ...result, overflow, stdout: Buffer.concat(out) });
       });
       if (input) child.stdin.end(input);
       else child.stdin.end();
     });
+  }
+
+  // Cleans a commit's tarball for the review step, in a fresh container with the same limits as the tests: see
+  // clean-worker.cjs. No PR code runs. Resolves { tar, report }. Throws when there is no trustworthy result, with
+  // err.code TOO_LARGE or UNREADABLE when the cause is the source rather than the machinery.
+  async cleanTree({ name, tarball, timeoutMs = 5 * 60_000 }) {
+    const r = await this.exec({
+      name,
+      script: 'exec node -e "$1"',
+      args: [readFileSync(CLEAN_WORKER, 'utf8')],
+      input: tarball,
+      timeoutMs,
+      stdoutLimit: CLEAN_TAR_LIMIT,
+    });
+    const coded = (message, code) => Object.assign(new Error(message), { code });
+    if (r.timedOut) throw new Error('cleaning the source timed out');
+    if (r.overflow) throw coded('cleaned source is over the size limit', 'TOO_LARGE');
+    if (r.code === 125) throw new Error(`docker could not run the container: ${r.log.slice(-300)}`);
+    if (r.code === 137) throw coded('cleaning the source was killed: memory limit reached', 'TOO_LARGE');
+    if (r.code === 3) throw coded('source is too large once unpacked', 'TOO_LARGE');
+    if (r.code === 2) throw coded('source archive cannot be read', 'UNREADABLE');
+    if (r.code !== 0) throw new Error(`cleaning the source failed (exit ${r.code})`);
+    let report;
+    try {
+      report = JSON.parse(r.log.trim().split('\n').at(-1));
+    } catch {
+      throw new Error('cleaning the source gave no report');
+    }
+    if (!Number.isInteger(report?.kept) || !Number.isInteger(report?.dropped_total) || !Array.isArray(report?.dropped)) {
+      throw new Error('cleaning the source gave no report');
+    }
+    return { tar: r.stdout, report };
   }
 
   // Removes containers left behind by a crash of the dispatcher.

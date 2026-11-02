@@ -1,0 +1,160 @@
+#!/bin/sh
+# The only command the review dispatcher may run as the review user: one sudoers line allows this file and nothing else.
+# service/review-user.sh installs a root-owned copy, so neither a PR nor the dispatcher can change what runs here.
+#
+#   run-review check [<job-id>]   access probes for `reviewer/main.js review-check`. Prints results, never file contents
+#   run-review <job-id>           starts the review of that job directory
+#
+# This version cannot call Claude: it has no model step and never loads the credential. It proves the containment first.
+
+# Start from nothing: no variable from the caller gets past this line.
+if [ "${ADABRA_WRAPPER_CLEAN:-}" != 1 ]; then
+  exec /usr/bin/env -i ADABRA_WRAPPER_CLEAN=1 PATH=/usr/bin:/bin /bin/sh /opt/adabra-review/bin/run-review "$@"
+fi
+unset ADABRA_WRAPPER_CLEAN
+set -eu
+umask 077
+OPT=/opt/adabra-review
+
+refuse() {
+  printf 'run-review: %s\n' "$1" >&2
+  exit "${2:-64}"
+}
+
+[ -r "$OPT/etc/paths.sh" ] || refuse 'not installed'
+# Root-owned, written by the installer: REVIEW_USER REVIEW_HOME DISPATCHER_HOME SERVICE_DIR
+. "$OPT/etc/paths.sh"
+[ "$(id -un)" = "$REVIEW_USER" ] || refuse 'must run as the review user'
+HOME=$REVIEW_HOME
+export HOME
+cd "$REVIEW_HOME"
+
+# Sets JOB, or refuses. The job id is the only thing the caller chooses, and the dispatcher's user owns in/, so a job could
+# hold a link pointing a reader at this user's own files.
+job() {
+  case "$1" in
+    '' | *[!0-9a-f-]*) refuse 'bad job id' ;;
+  esac
+  printf '%s\n' "$1" | grep -Eq '^[1-9][0-9]{0,8}-[0-9a-f]{40}-[0-9]{10,16}$' || refuse 'bad job id'
+  JOB=$OPT/in/$1
+  [ -d "$JOB" ] && [ ! -L "$JOB" ] || refuse 'no such job'
+  links=$(find "$JOB" -type l) || refuse 'cannot inspect the job'
+  [ -z "$links" ] || refuse 'the job holds a symbolic link'
+}
+
+say() {
+  printf '%s=%s\n' "$1" "$2"
+}
+
+# Opens the path and closes it without reading a byte: the answer is whether this user may, not what is there.
+access() {
+  if err=$( (exec 3<"$1") 2>&1); then
+    echo open
+    return
+  fi
+  case $err in
+    *ermission*) echo denied ;;
+    *'No such file'*) echo missing ;;
+    *) echo error ;;
+  esac
+}
+
+# Not nc -z: on macOS that reports a live socket as closed. A timeout means it connected and then sat waiting.
+connects() {
+  code=0
+  timeout 3 nc -U "$1" </dev/null >/dev/null 2>&1 || code=$?
+  case $code in
+    0 | 124) echo CONNECTED ;;
+    *) echo refused ;;
+  esac
+}
+
+writable() {
+  if [ -w "$1" ]; then echo yes; else echo no; fi
+}
+
+checks() {
+  say user "$(id -un)"
+  say primary_group "$(id -gn)"
+  say gid "$(id -g)"
+  case " $(id -Gn) " in
+    *' admin '*) say admin yes ;;
+    *) say admin no ;;
+  esac
+  if sudo -n -l >/dev/null 2>&1; then say sudo SOME; else say sudo none; fi
+  say env "$(env | cut -d= -f1 | sort | paste -s -d, -)"
+
+  if [ -s "$REVIEW_HOME/.review-credential" ]; then
+    say credential present
+    say credential_mode "$(stat -f %Lp "$REVIEW_HOME/.review-credential" 2>/dev/null || echo unknown)"
+  else
+    say credential missing
+  fi
+
+  for entry in \
+    "canary:$DISPATCHER_HOME/.adabra-review-canary" \
+    "home:$DISPATCHER_HOME" \
+    "review_token:$DISPATCHER_HOME/.adabra/review-token" \
+    "github_token:$DISPATCHER_HOME/.adabra/github-token" \
+    "device_token:$DISPATCHER_HOME/.adabra/reviewer-device-token" \
+    "helper_token:$DISPATCHER_HOME/.team-agent/token" \
+    "gh_login:$DISPATCHER_HOME/.config/gh/hosts.yml" \
+    "claude_login:$DISPATCHER_HOME/.claude.json" \
+    "keychains:$DISPATCHER_HOME/Library/Keychains" \
+    "launch_agents:$DISPATCHER_HOME/Library/LaunchAgents" \
+    "coordinator_db:$SERVICE_DIR/coordinator.db" \
+    "reviewer_db:$SERVICE_DIR/reviewer.db"; do
+    say "read.${entry%%:*}" "$(access "${entry#*:}")"
+  done
+
+  if [ -x /usr/bin/nc ]; then say tool.nc present; else say tool.nc missing; fi
+  say socket.docker_home "$(connects "$DISPATCHER_HOME/.docker/run/docker.sock")"
+  say socket.docker_var "$(connects /var/run/docker.sock)"
+
+  for entry in \
+    "wrapper:$OPT/bin/run-review" \
+    "cli:$OPT/bin/claude" \
+    "paths:$OPT/etc/paths.sh" \
+    "settings:$OPT/etc/settings.json" \
+    "schema:$OPT/etc/review-schema.json" \
+    "skill:$OPT/skill/review-v1.md" \
+    "bin_dir:$OPT/bin" \
+    "etc_dir:$OPT/etc" \
+    "skill_dir:$OPT/skill" \
+    "job_root:$OPT/in"; do
+    say "writable.${entry%%:*}" "$(writable "${entry#*:}")"
+  done
+
+  if [ -n "${1:-}" ]; then
+    job "$1"
+    say job.tree "$(access "$JOB/tree")"
+    say job.diff "$(access "$JOB/diff.patch")"
+    say job.pr "$(access "$JOB/pr.json")"
+    say job.file "$(access "$JOB/tree/README.md")"
+    say job.write_file "$(writable "$JOB/diff.patch")"
+    if probe=$(mktemp "$JOB/probe.XXXXXX" 2>/dev/null); then
+      rm -f "$probe"
+      say job.create CREATED
+    else
+      say job.create denied
+    fi
+    if probe=$(mktemp "$JOB/tree/probe.XXXXXX" 2>/dev/null); then
+      rm -f "$probe"
+      say job.create_tree CREATED
+    else
+      say job.create_tree denied
+    fi
+  fi
+}
+
+case "${1:-}" in
+  check)
+    [ $# -le 2 ] || refuse 'usage: run-review check [<job-id>] | <job-id>'
+    checks "${2:-}"
+    ;;
+  *)
+    [ $# -eq 1 ] || refuse 'usage: run-review check [<job-id>] | <job-id>'
+    job "$1"
+    refuse 'the model step is not installed: this version only proves containment' 78
+    ;;
+esac

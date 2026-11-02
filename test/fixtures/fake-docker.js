@@ -30,5 +30,14 @@ process.stdin.on('end', () => {
     case 'docker-error': console.error('docker: Error response from daemon: No such image'); process.exit(125);
     case 'biglog': process.stdout.write('x'.repeat(1_000_000) + '\nTHE-END\n', () => process.exit(1)); break;
     case 'hang': setInterval(() => {}, 1000); break; // until killed
+    case 'clean-ok':
+      process.stderr.write('{"kept":1,"bytes":7,"dropped_total":0,"dropped":[]}\n');
+      process.stdout.write(Buffer.from([0, 255, 1, 254, 0, 10, 13]), () => process.exit(0));
+      break;
+    case 'clean-unreadable': process.exit(2);
+    case 'clean-too-large': process.exit(3);
+    case 'clean-no-report': process.exit(0);
+    case 'clean-bad-report': process.stderr.write('{"kept":"many"}\n', () => process.exit(0)); break;
+    case 'clean-flood': process.stdout.write(Buffer.alloc(100_000), () => process.exit(0)); break;
   }
 });

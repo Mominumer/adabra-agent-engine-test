@@ -6,6 +6,7 @@
 //   node reviewer/main.js status         queue counts and recent jobs
 //   node reviewer/main.js retry <pr>     run the latest commit of a PR again
 //   node reviewer/main.js sandbox-check  prove the Docker sandbox is locked down (no PR needed)
+//   node reviewer/main.js review-check   prove the review user's containment (no PR, no token, no model call; needs service/review-user.sh)
 //
 // Environment:
 //   GITHUB_REPO          owner/name
@@ -32,15 +33,32 @@ import { Dispatcher } from './dispatcher.js';
 import { mockReview } from './review-mock.js';
 import { Sandbox, selfCheck } from './sandbox.js';
 import { startTaskResults } from './task-results.js';
+import { reviewCheck } from './review-check.js';
 
 const log = (m) => console.log(`${new Date().toISOString()} ${m}`);
 const [cmd, ...args] = process.argv.slice(2);
-const store = new ReviewStore(process.env.REVIEW_DB ?? './reviewer.db');
 const sandbox = new Sandbox({
   image: process.env.REVIEW_IMAGE,
   cmd: process.env.REVIEW_TEST_CMD,
   timeoutMs: process.env.REVIEW_TIMEOUT_MS ? Number(process.env.REVIEW_TIMEOUT_MS) : undefined,
 });
+
+// Before the database opens: this check needs neither the queue nor a token.
+if (cmd === 'review-check') {
+  let r;
+  try {
+    await sandbox.ensureDocker();
+    r = await reviewCheck({ sandbox });
+  } catch (err) {
+    console.error(`review-check could not finish: ${err.message}`);
+    process.exit(1);
+  }
+  for (const x of r.results) console.log(`${x.ok ? 'PASS' : 'FAIL'}  ${x.check.padEnd(28)} want ${x.want}  got ${x.got}`);
+  console.log(r.ok ? 'review user is contained' : 'REVIEW USER NOT CONTAINED - do not build the real review on this');
+  process.exit(r.ok ? 0 : 1);
+}
+
+const store = new ReviewStore(process.env.REVIEW_DB ?? './reviewer.db');
 
 function github() {
   const repo = process.env.GITHUB_REPO;
@@ -111,6 +129,6 @@ if (cmd === 'serve') {
 } else if (cmd === 'retry' && Number.isInteger(Number(args[0]))) {
   console.log(store.retry(Number(args[0])) ? `PR #${args[0]} queued again` : `no jobs for PR #${args[0]}`);
 } else {
-  console.error('usage: main.js serve | poll-once | status | retry <pr> | sandbox-check');
+  console.error('usage: main.js serve | poll-once | status | retry <pr> | sandbox-check | review-check');
   process.exit(2);
 }
