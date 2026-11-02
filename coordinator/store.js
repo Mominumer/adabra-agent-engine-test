@@ -532,6 +532,13 @@ export class Store {
     return dead;
   }
 
+  // Waits without using an attempt, so it can never go dead this way. For when the fault is not the event's: see the worker.
+  holdEvent(eventId, error, nextAttemptAt) {
+    this.db
+      .prepare('UPDATE events SET next_attempt_at = ?, last_error = ? WHERE event_id = ?')
+      .run(nextAttemptAt, String(error).slice(0, 500), eventId);
+  }
+
   counts() {
     return Object.fromEntries(
       this.db

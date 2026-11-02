@@ -111,6 +111,14 @@ export class ReviewStore {
     });
   }
 
+  // Back to the queue, taking back the attempt markRunning counted, so it can never use up its attempts this way.
+  // For when the fault is not the job's: see the dispatcher.
+  holdJob(pr, sha, error, nextAttemptAt) {
+    this.db
+      .prepare("UPDATE jobs SET state = 'queued', attempts = MAX(attempts - 1, 0), next_attempt_at = ?, last_error = ? WHERE pr = ? AND sha = ?")
+      .run(nextAttemptAt, String(error).slice(0, 500), pr, sha);
+  }
+
   // --- results for the coordinator ----------------------------------------
   // Oldest first. The coordinator decides what is stale, so order here is only a courtesy.
   dueTaskResults(now) {
