@@ -1,7 +1,8 @@
-import { chmodSync, existsSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 import { findingLocation, VERDICT_TEXT } from '../shared/review-result.js';
+import { replaceFile, retryWhileShared } from './platform.js';
 
 // What this device believes it holds, kept in $TEAM_AGENT_HOME/claims.json.
 // The coordinator is the authority; this file only remembers run id and generation between commands.
@@ -11,7 +12,7 @@ export class ClaimFile {
   }
 
   #read() {
-    return existsSync(this.path) ? JSON.parse(readFileSync(this.path, 'utf8')) : {};
+    return existsSync(this.path) ? JSON.parse(retryWhileShared(() => readFileSync(this.path, 'utf8'))) : {};
   }
 
   all() {
@@ -26,7 +27,7 @@ export class ClaimFile {
   #write(all) {
     const tmp = `${this.path}.${process.pid}.tmp`;
     writeFileSync(tmp, JSON.stringify(all, null, 2), { mode: 0o600 });
-    renameSync(tmp, this.path);
+    replaceFile(tmp, this.path);
   }
 
   set(taskId, claim) {

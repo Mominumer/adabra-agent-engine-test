@@ -71,8 +71,34 @@ node helper/cli.js status             # outbox, claims held, and whether the age
 service/helper-service.sh uninstall
 ```
 
-After `claim`, nobody needs to run `heartbeat` or `flush`. If a claim is lost the agent drops it and shows a macOS notification.
-Windows laptops need an equivalent (Task Scheduler); not built yet.
+After `claim`, nobody needs to run `heartbeat` or `flush`. If a claim is lost the agent drops it and shows a desktop notification.
+
+## Run the helper on Windows
+
+Run these in PowerShell from the repo folder. You need Node 22.13 or newer on PATH. You do not need admin rights, and no
+password is stored. **Not yet run on a real Windows machine**: if something misbehaves, the log and `status` are the place to start.
+
+```powershell
+node helper\cli.js enroll https://<coordinator-host> <device-id>
+Get-Clipboard | Set-Content -NoNewline -Encoding ascii -LiteralPath "$HOME\.team-agent\token"   # copy the token first
+
+powershell -NoProfile -ExecutionPolicy Bypass -File service\helper-service.ps1 install
+powershell -NoProfile -ExecutionPolicy Bypass -File service\helper-service.ps1 status
+powershell -NoProfile -ExecutionPolicy Bypass -File service\helper-service.ps1 logs        # %LOCALAPPDATA%\Adabra\Logs\adabra-helper.log
+powershell -NoProfile -ExecutionPolicy Bypass -File service\helper-service.ps1 uninstall
+node helper\cli.js status                                                                   # outbox, claims held, and whether the agent is reporting
+```
+
+`-ExecutionPolicy Bypass` applies to that one command and changes no setting. `install` is safe to repeat; run it again after
+moving the repo folder or Node. `uninstall` leaves your enrollment and the log in place.
+
+- **Starts at logon, in your session.** The task `ai.adabra.helper` runs only while you are logged on, on battery too, with no
+  time limit and no window. A lost claim shows a Windows notification, and is always in the log.
+- **Comes back after a crash.** A supervisor restarts the agent after 10 seconds. If the supervisor itself dies, a trigger that
+  fires every minute starts the task again; while the task is running that trigger does nothing.
+- **What protects the token.** `chmod` and `umask` do nothing on Windows; the folder's access list does the job. Your profile
+  folder already allows only you, SYSTEM and Administrators, and `install` sets the same on `TEAM_AGENT_HOME`, wherever it is.
+  `status` warns if anyone else can open the folder or the token. As with root on macOS, an administrator can always read it.
 
 ## Assigning work
 
