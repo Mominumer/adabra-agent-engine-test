@@ -1,6 +1,7 @@
 import { REVIEW_MARKER } from './github.js';
 import { buildResult, parseTaskId } from './task-results.js';
 import { fence, quiet } from '../shared/sanitize.js';
+import { AUTH_HOLD_MS, upsertComment } from '../shared/github-auth.js';
 
 export const CONTEXTS = { tests: 'adabra/tests', review: 'adabra/review' };
 const STATES = new Set(['success', 'failure', 'error']);
@@ -96,14 +97,14 @@ export class Dispatcher {
       review = normalize(await this.runReview(job), 'review');
     } catch (err) {
       // The machinery failed (e.g. Docker down), not the PR: say so on GitHub and try again later.
-      return this.#retry(job, `runner: ${err.message}`, 'Review infrastructure problem; retrying');
+      return this.#retry(job, `runner: ${err.message}`, 'Review infrastructure problem; retrying', err);
     }
     try {
       await this.github.setStatus(job.sha, CONTEXTS.tests, tests.state, tests.summary || tests.state);
       await this.github.setStatus(job.sha, CONTEXTS.review, review.state, review.summary || review.state);
       await this.#upsertComment(job, renderComment(job, tests, review));
     } catch (err) {
-      return this.#retry(job, `github: ${err.message}`, null);
+      return this.#retry(job, `github: ${err.message}`, null, err);
     }
     // Only now, with the statuses posted: the job and its result for the task are saved together, or not at all.
     this.store.markDone(job.pr, job.sha, { tests: tests.state, review: review.state }, this.#taskResult(job, tests, review));
@@ -124,7 +125,14 @@ export class Dispatcher {
     }
   }
 
-  async #retry(job, error, statusText) {
+  async #retry(job, error, statusText, cause) {
+    // Our own credentials are out, which says nothing about this job: it waits, however long that takes, and no attempt is used.
+    // No status either, as GitHub would refuse it.
+    if (cause?.authOutage) {
+      this.store.holdJob(job.pr, job.sha, error, this.now() + AUTH_HOLD_MS);
+      this.log(`PR #${job.pr} ${job.sha.slice(0, 12)} held, not counted as an attempt: ${error}`);
+      return { pr: job.pr, sha: job.sha, retry: true, failed: false };
+    }
     // Giving up is an outcome the task should hear about too, or it goes on showing the verdict on an older commit.
     // The reason stays here: it is machinery detail, and the task's comment is public.
     const gaveUp = { state: 'error', summary: GAVE_UP, findings: [], reviewer: null };
@@ -140,18 +148,17 @@ export class Dispatcher {
   }
 
   async #upsertComment(job, body) {
-    let id = this.store.commentId(job.pr);
-    if (id) {
-      try {
-        return await this.github.updateComment(id, body);
-      } catch (err) {
-        if (err.status !== 404) throw err; // deleted by someone: find or recreate below
-      }
-    }
-    // Found by its marker, so a crash between creating it and remembering its id cannot create a second one.
-    const found = await this.github.findReviewComment(job.pr);
-    if (found) await this.github.updateComment(found, body);
-    this.store.setCommentId(job.pr, found ?? (await this.github.createComment(job.pr, body)));
+    const remembered = this.store.commentId(job.pr);
+    const id = await upsertComment({
+      remembered,
+      label: `PR #${job.pr}`,
+      log: this.log,
+      // Found by its marker, so a crash between creating it and remembering its id cannot create a second one.
+      find: () => this.github.findReviewComment(job.pr),
+      update: (commentId) => this.github.updateComment(commentId, body),
+      create: () => this.github.createComment(job.pr, body),
+    });
+    if (id !== remembered) this.store.setCommentId(job.pr, id);
   }
 }
 

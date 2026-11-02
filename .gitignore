@@ -4,6 +4,8 @@ node_modules/
 *.db-shm
 token
 *token*
+*.pem
+*.key
 .env
 .DS_Store
 .claude/settings.local.json

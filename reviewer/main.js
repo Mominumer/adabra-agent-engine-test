@@ -7,10 +7,13 @@
 //   node reviewer/main.js retry <pr>     run the latest commit of a PR again
 //   node reviewer/main.js sandbox-check  prove the Docker sandbox is locked down (no PR needed)
 //   node reviewer/main.js review-check   prove the review user's containment (no PR, no token, no model call; needs service/review-user.sh)
+//   node reviewer/main.js github-check   do these GitHub settings work? reads only, opens no database
 //
 // Environment:
 //   GITHUB_REPO          owner/name
 //   REVIEW_TOKEN_FILE    the reviewer's own fine-grained token (default ~/.adabra/review-token)
+//   REVIEW_APP_ID, REVIEW_APP_INSTALLATION_ID, REVIEW_APP_KEY_FILE
+//                        use a GitHub App instead of the token file: all three, or none. See the README.
 //   REVIEW_AUTHORS       comma-separated GitHub logins whose PRs may run on the mini (required for serve)
 //   REVIEW_DB            SQLite path (default ./reviewer.db)
 //   REVIEW_POLL_MS       default 60000
@@ -28,12 +31,13 @@ import { readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { ReviewStore } from './store.js';
-import { ReviewGitHub } from './github.js';
+import { REVIEW_PERMISSIONS, ReviewGitHub } from './github.js';
 import { Dispatcher } from './dispatcher.js';
 import { mockReview } from './review-mock.js';
 import { Sandbox, selfCheck } from './sandbox.js';
 import { startTaskResults } from './task-results.js';
 import { reviewCheck } from './review-check.js';
+import { appAuthFromEnv, gitHubCheck } from '../shared/github-auth.js';
 
 const log = (m) => console.log(`${new Date().toISOString()} ${m}`);
 const [cmd, ...args] = process.argv.slice(2);
@@ -58,15 +62,30 @@ if (cmd === 'review-check') {
   process.exit(r.ok ? 0 : 1);
 }
 
-const store = new ReviewStore(process.env.REVIEW_DB ?? './reviewer.db');
-
-function github() {
+// Refuses to go on if the app settings are incomplete or invalid. The token file is read only when none of them is set.
+function realGitHub() {
   const repo = process.env.GITHUB_REPO;
   if (!repo) throw new Error('GITHUB_REPO is not set');
-  const real = new ReviewGitHub({
+  const auth = appAuthFromEnv({ prefix: 'REVIEW', repo, permissions: REVIEW_PERMISSIONS });
+  if (auth) return new ReviewGitHub({ repo, auth });
+  return new ReviewGitHub({
     repo,
     token: readFileSync(process.env.REVIEW_TOKEN_FILE ?? join(homedir(), '.adabra', 'review-token'), 'utf8').trim(),
   });
+}
+
+// Also before the database opens: this check needs no database, and must not leave one behind.
+if (cmd === 'github-check') {
+  const gh = realGitHub();
+  const read = async () => `read check: ${(await gh.openPulls()).length} open pull request(s)`;
+  process.exit((await gitHubCheck({ auth: gh.auth, read })) ? 0 : 1);
+}
+
+const store = new ReviewStore(process.env.REVIEW_DB ?? './reviewer.db');
+
+function github() {
+  const real = realGitHub();
+  log(`GitHub auth: ${real.auth.describe()}`);
   if (process.env.REVIEW_DRY_RUN !== '1') return real;
   let id = 5000;
   return {
@@ -129,6 +148,6 @@ if (cmd === 'serve') {
 } else if (cmd === 'retry' && Number.isInteger(Number(args[0]))) {
   console.log(store.retry(Number(args[0])) ? `PR #${args[0]} queued again` : `no jobs for PR #${args[0]}`);
 } else {
-  console.error('usage: main.js serve | poll-once | status | retry <pr> | sandbox-check | review-check');
+  console.error('usage: main.js serve | poll-once | status | retry <pr> | sandbox-check | review-check | github-check');
   process.exit(2);
 }
