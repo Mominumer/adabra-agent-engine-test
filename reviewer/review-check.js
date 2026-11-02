@@ -20,7 +20,7 @@ const ROOT_OWNED = [
 // What a shell started with a clean environment sets for itself, and what the wrapper sets. Anything else came from outside.
 const ALLOWED_ENV = new Set(['HOME', 'PATH', 'PWD', 'OLDPWD', 'SHLVL', '_', '__CF_USER_TEXT_ENCODING']);
 
-function defaultRun(file, args, options = {}) {
+export function defaultRun(file, args, options = {}) {
   return new Promise((resolve) => {
     execFile(file, args, { timeout: 60_000, maxBuffer: 1024 * 1024, ...options }, (err, stdout, stderr) => {
       resolve({ code: err ? (typeof err.code === 'number' ? err.code : -1) : 0, stdout: String(stdout), stderr: String(stderr) });

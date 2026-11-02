@@ -7,6 +7,8 @@
 //   node reviewer/main.js retry <pr>     run the latest commit of a PR again
 //   node reviewer/main.js sandbox-check  prove the Docker sandbox is locked down (no PR needed)
 //   node reviewer/main.js review-check   prove the review user's containment (no PR, no token, no model call; needs service/review-user.sh)
+//   node reviewer/main.js review-check --live [--yes]   the same proof with 2 paid runs on a hostile fixture: see review-live.js
+//   node reviewer/main.js seeded-run [--yes] [--run-name <name>]   up to 25 paid runs on a set with known answers, and its numbers: see seeded-run.js
 //   node reviewer/main.js github-check   do these GitHub settings work? reads only, opens no database
 //   node reviewer/main.js override <pr> --reason "..."   operator only, at a terminal: see override.js and service/ops.sh
 //
@@ -28,6 +30,7 @@
 //   REVIEW_UNSHOWN_OK    comma-separated extensions a changed file may have when GitHub will not show it (default: images and fonts)
 //   REVIEW_LOG_FILE      where override leaves its record (default ~/Library/Logs/adabra-reviewer.log, the service's log)
 //   ADABRA_STOP_FILE     the operator's emergency stop (default ~/.adabra-control/stop.json); see service/ops.sh
+//   REVIEW_RUNS_DIR      where the live check and the seeded run keep their local results (default ~/.adabra-review-runs)
 //
 // Telling the coordinator how a task's review went (off unless the device identity is set; reviews run the same either way):
 //   REVIEW_DEVICE_ID          this reviewer's enrolled device, role reviewer (coordinator: device-add <id> reviewer)
@@ -45,6 +48,9 @@ import { Sandbox, selfCheck } from './sandbox.js';
 import { startTaskResults } from './task-results.js';
 import { reviewCheck } from './review-check.js';
 import { overrideCommand } from './override.js';
+import { liveCommand } from './review-live.js';
+import { reviewRunLines } from './run-summary.js';
+import { seededCommand } from './seeded-run.js';
 import { isStopped, readStop, stopLine, watchStop } from '../shared/stop.js';
 import { appAuthFromEnv, gitHubCheck } from '../shared/github-auth.js';
 
@@ -58,8 +64,9 @@ const sandbox = new Sandbox({
 
 // Before the database opens: this check needs neither the queue nor a token.
 if (cmd === 'review-check') {
+  if (args[0] === '--live') process.exit(await liveCommand({ args: args.slice(1), sandbox }));
   if (args.length) {
-    console.error('review-check takes no options: the live run is not built yet, and this check never calls a model');
+    console.error('review-check takes no other options: without --live this check never calls a model');
     process.exit(2);
   }
   let r;
@@ -74,6 +81,9 @@ if (cmd === 'review-check') {
   console.log(r.ok ? 'review user is contained' : 'REVIEW USER NOT CONTAINED - do not build the real review on this');
   process.exit(r.ok ? 0 : 1);
 }
+
+// Also before the database opens: it finds the service's own, and never leaves a new empty one where it was started.
+if (cmd === 'seeded-run') process.exit(await seededCommand({ args, sandbox }));
 
 // Refuses to go on if the app settings are incomplete or invalid. The token file is read only when none of them is set.
 function realGitHub() {
@@ -164,6 +174,7 @@ if (cmd === 'serve') {
   if (pause) console.log(`real reviews paused (${pause.kind}) ${pause.until ? `until ${new Date(pause.until).toISOString()}` : 'until retry or a restart'}`);
   const paidToday = store.paidRunsOn(Date.now());
   if (paidToday) console.log(`real review runs today (UTC): ${paidToday}`);
+  for (const line of reviewRunLines(store.reviewRunTotals())) console.log(line);
   for (const j of store.recent(10)) {
     const res = j.result ? `tests ${j.result.tests}, review ${j.result.review}` : (j.last_error ?? '');
     console.log(`PR #${j.pr} ${j.sha.slice(0, 12)} ${j.state} (attempts ${j.attempts}) ${res}`);
@@ -181,6 +192,6 @@ if (cmd === 'serve') {
 } else if (cmd === 'retry' && Number.isInteger(Number(args[0]))) {
   console.log(store.retry(Number(args[0])) ? `PR #${args[0]} queued again` : `no jobs for PR #${args[0]}`);
 } else {
-  console.error('usage: main.js serve | poll-once | status | retry <pr> | sandbox-check | review-check | github-check | override <pr> --reason "..."');
+  console.error('usage: main.js serve | poll-once | status | retry <pr> | sandbox-check | review-check [--live [--yes]] | seeded-run [--yes] [--run-name <name>] | github-check | override <pr> --reason "..."');
   process.exit(2);
 }

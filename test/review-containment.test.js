@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir, userInfo } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -590,13 +590,17 @@ test('wrapper: with the model step on, bad ids and links are still refused befor
   assert.ok(!existsSync(join(dir, 'claude-called')));
 });
 
-test('wrapper: a stale config directory from a killed run is cleared, and each run gets a new one', (t) => {
+test('wrapper: a stale config directory from a killed run is cleared, one a run beside it may be using is not, and each run gets a new one', (t) => {
   const { dir, env, home } = installWrapper(t, { modelEnabled: true, withCredential: true });
   mkdirSync(join(home, '.claude-run.stale'));
+  const longAgo = new Date(Date.now() - 31 * 60_000);
+  utimesSync(join(home, '.claude-run.stale'), longAgo, longAgo);
+  mkdirSync(join(home, '.claude-run.beside'));
   const id = `7-${SHA}-1700000000000`;
   markedJob(dir, id);
   assert.equal(wrapper(dir, env, [id]).status, 0);
   assert.ok(!existsSync(join(home, '.claude-run.stale')));
+  assert.ok(existsSync(join(home, '.claude-run.beside')));
 });
 
 test('wrapper: the check reports the model step, for review-check to compare', (t) => {
@@ -886,8 +890,8 @@ test('review-check: a tampered switch is caught, and a wrapper older than the sw
   assert.equal(older.results.find((x) => x.check === 'wrapper.model_step').ok, true);
 });
 
-test('review-check --live is refused until it exists: the plain check must stay the one that cannot spend', () => {
-  const r = spawnSync(process.execPath, [join(REPO, 'reviewer', 'main.js'), 'review-check', '--live'], { encoding: 'utf8', env: { PATH: process.env.PATH } });
+test('review-check takes --live and nothing else: without it, this is the check that cannot spend', () => {
+  const r = spawnSync(process.execPath, [join(REPO, 'reviewer', 'main.js'), 'review-check', '--lively'], { encoding: 'utf8', env: { PATH: process.env.PATH } });
   assert.equal(r.status, 2);
   assert.match(r.stderr, /never calls a model/);
 });

@@ -43,7 +43,9 @@ if [ "$CMD" = uninstall ]; then
   rm -f "$SUDOERS"
   rm -rf "$OPT/in" "$OPT/etc" "$OPT/skill"
   rm -f "$OPT/bin/run-review"
-  echo "removed the sudoers line, wrapper, settings and job directories"
+  RU_HOME="$(home_of "$RU" || true)"
+  if safe_path "$RU_HOME"; then rm -f "$RU_HOME/.review-canary"; fi
+  echo "removed the sudoers line, wrapper, settings, job directories and canary"
   echo "kept: the $RU user, its home and login, and $OPT/bin/claude"
   exit 0
 fi
@@ -122,6 +124,20 @@ echo "== Starting the wrapper once as $RU"
 cd /
 sudo -n -u "$RU" "$OPT/bin/run-review" check >/dev/null || die "the wrapper did not run as $RU"
 ok "it runs"
+
+# The live check needs a file the review user may read outside its job, and only this script can put one in that home. It is written by
+# the review user itself, so root never writes through anything that user has left in its own home. It is not a secret, and it is never
+# the credential: the same random text in etc/ is how the live check recognises it, and is a second such file outside the home.
+echo "== Planting the canary for review-check --live"
+CANARY="adabra-live-canary-$(od -An -N24 -tx1 /dev/urandom | tr -d ' \n')"
+CANARY_TMP="$(mktemp "$OPT/etc/.canary.XXXXXX")"
+printf '%s\n' "$CANARY" > "$CANARY_TMP"
+chown root:wheel "$CANARY_TMP"
+chmod 644 "$CANARY_TMP"
+mv -f "$CANARY_TMP" "$OPT/etc/live-canary"
+printf '%s\n' "$CANARY" | sudo -n -u "$RU" /bin/sh -c 'umask 077; rm -f "$1"; cat > "$1"; chmod 400 "$1"' sh "$RU_HOME/.review-canary" \
+  || die "could not plant the canary in $RU_HOME"
+ok "$RU_HOME/.review-canary and $OPT/etc/live-canary"
 
 echo "== The model step"
 if [ "$OPTION" = --enable-model ]; then

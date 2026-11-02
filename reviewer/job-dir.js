@@ -11,6 +11,7 @@ const BUILDING_RE = /^\.building-[1-9][0-9]{0,8}-[0-9a-f]{40}-[0-9]{10,16}$/;
 const DIR_MODE = 0o750;
 const FILE_MODE = 0o640;
 export const PAID_MARK = 'paid-run';
+export const STREAM_MARK = 'stream-output'; // the wrapper then asks the CLI for line-by-line output: only the live check writes this
 
 export function jobId(pr, sha, now = Date.now()) {
   const id = `${pr}-${sha}-${now}`;
@@ -39,21 +40,23 @@ function makeDir(path) {
   chmodSync(path, DIR_MODE);
 }
 
+function writeBelow(dest, path, data, made) {
+  const target = join(dest, path);
+  const parents = [];
+  for (let d = dirname(target); d !== dest; d = dirname(d)) parents.unshift(d);
+  for (const d of parents) {
+    if (made.has(d)) continue;
+    makeDir(d);
+    made.add(d);
+  }
+  writeNew(target, data);
+}
+
 // Unpacks only what the cleaning step produced. No owners or modes come from the archive. Returns [{ path, size }].
 export function unpackCleanTar(tar, dest) {
   const files = readCleanTar(tar);
   const made = new Set();
-  for (const { path, data } of files) {
-    const target = join(dest, path);
-    const parents = [];
-    for (let d = dirname(target); d !== dest; d = dirname(d)) parents.unshift(d);
-    for (const d of parents) {
-      if (made.has(d)) continue;
-      makeDir(d);
-      made.add(d);
-    }
-    writeNew(target, data);
-  }
+  for (const { path, data } of files) writeBelow(dest, path, data, made);
   return files.map(({ path, data }) => ({ path, size: data.length }));
 }
 
@@ -61,7 +64,8 @@ export function unpackCleanTar(tar, dest) {
 // Returns { id, dir, files }. `report` is the cleaning step's report of what it dropped.
 // `paid` writes the mark the wrapper requires before it starts the model. Off by default, so a job built for any other reason cannot
 // spend. It sits beside tree/, which is the only place PR content goes, so a PR cannot plant it.
-export function buildJobDir({ root = JOB_ROOT, pr, sha, tar, report, diff = '', title = '', body = '', task = null, now = Date.now(), paid = false }) {
+// `besideTree` is more files beside tree/, for the live check. No path that takes a PR's content sets it.
+export function buildJobDir({ root = JOB_ROOT, pr, sha, tar, report, diff = '', title = '', body = '', task = null, now = Date.now(), paid = false, besideTree = {} }) {
   const id = jobId(pr, sha, now);
   const building = join(root, `.building-${id}`);
   const dir = join(root, id);
@@ -78,6 +82,8 @@ export function buildJobDir({ root = JOB_ROOT, pr, sha, tar, report, diff = '', 
       dropped: report?.dropped ?? [],
     }, null, 2));
     if (paid) writeNew(join(building, PAID_MARK), '');
+    const made = new Set();
+    for (const [path, data] of Object.entries(besideTree)) writeBelow(building, path, data, made);
     renameSync(building, dir);
     return { id, dir, files };
   } catch (err) {
