@@ -78,11 +78,12 @@ export const replaceFile = (tmp, target, options) => retryWhileShared(() => rena
 
 // Reads a one-line secret. Windows PowerShell 5.1 writes UTF-16 for `>` and a BOM for `Set-Content -Encoding utf8`.
 // trim() also removes a BOM, which counts as whitespace in JavaScript.
-export function readSecretFile(path) {
-  const raw = readFileSync(path);
+export function decodeSecret(raw) {
   const text = raw[0] === 0xff && raw[1] === 0xfe ? raw.toString('utf16le') : raw.toString('utf8');
   return text.trim();
 }
+
+export const readSecretFile = (path) => decodeSecret(readFileSync(path));
 
 // How to save the device token. Windows has no umask or pbpaste, and its `>` would write UTF-16.
 export function tokenSaveHint(tokenPath, platform = process.platform) {

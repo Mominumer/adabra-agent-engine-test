@@ -55,7 +55,7 @@ Stop any coordinator running in a Terminal window first (port 8787). The mini mu
 ## Run on a laptop (helper)
 
 ```bash
-node helper/cli.js enroll https://jbrs-mac-mini.tail1aa763.ts.net member-a
+node helper/cli.js enroll https://<coordinator-host> member-a
 umask 077; pbpaste > ~/.team-agent/token              # the token printed by device-add
 node helper/cli.js checkpoint --task TASK-1 --summary "Payment screen implemented" \
   --verification "8 passed, 1 failed" --next "Fix failed payment handling"
@@ -99,6 +99,24 @@ moving the repo folder or Node. `uninstall` leaves your enrollment and the log i
 - **What protects the token.** `chmod` and `umask` do nothing on Windows; the folder's access list does the job. Your profile
   folder already allows only you, SYSTEM and Administrators, and `install` sets the same on `TEAM_AGENT_HOME`, wherever it is.
   `status` warns if anyone else can open the folder or the token. As with root on macOS, an administrator can always read it.
+
+## Onboarding a teammate
+
+`onboarding/` is the kit: one command for the operator, one script each for a Mac and a Windows teammate, and a one-page guide
+(`onboarding/GUIDE.md`) for someone who has never seen this project. **The Windows script has not been run on a real Windows machine.**
+
+```bash
+node onboarding/operator.js add <device-id> --coordinator https://<coordinator-host> --test-task <TASK-N>   # on the coordinator's machine
+onboarding/setup-mac.sh --coordinator https://<coordinator-host> --device <device-id> --test-task <TASK-N>  # on the teammate's Mac
+node onboarding/operator.js rotate <device-id>                                                              # a lost token; never prints it
+node onboarding/operator.js revoke <device-id>                                                              # a device that leaves, or a throwaway test
+```
+
+`add` never shows the token: it writes it to a file only you can read, and prints what to do next. Use it rather than `device-add`
+on a shared screen. The address and IDs are inputs, and the only secret is that file, which you send privately and then delete.
+
+To try the script on a machine that already has a helper, add `--home <a new folder>`: the usual `~/.team-agent` and the `ai.adabra.helper`
+service are then left alone, because a separate folder never installs the service. `--skip-service` skips it on its own.
 
 ## Assigning work
 
