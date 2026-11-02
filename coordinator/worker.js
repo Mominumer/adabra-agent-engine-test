@@ -38,6 +38,15 @@ export class Worker {
           this.log(`${dead ? 'DEAD' : 'retry'} ${row.event_id}: ${err.message}`);
         }
       }
+      for (const row of this.store.dueReviewComments(now)) {
+        if (failedTasks.has(row.task_id)) continue; // GitHub just refused this task's comment: back off with the event
+        try {
+          await this.#applyReview(row);
+        } catch (err) {
+          this.store.reviewCommentFailed(row.task_id, row.result_id, err.message, now);
+          this.log(`retry review ${row.result_id}: ${err.message}`);
+        }
+      }
     } finally {
       this.running = false;
     }
@@ -52,7 +61,21 @@ export class Worker {
       return;
     }
 
-    const body = renderComment(event);
+    await this.#writeComment(task, renderComment(event, this.store.reviewForComment(event.task_id)));
+    this.store.setTaskApplied(event.task_id, event.ts);
+    this.store.markDone(event.event_id);
+    this.log(`applied ${event.event_id} to ${event.task_id}`);
+  }
+
+  // A review result never takes part in the ordering of checkpoints above: reviewer and builder clocks differ.
+  async #applyReview({ task_id: taskId, result_id: resultId }) {
+    const review = this.store.reviewForComment(taskId);
+    await this.#writeComment(this.store.getTask(taskId), renderComment(this.store.lastAppliedEvent(taskId), review));
+    this.store.reviewCommentDone(taskId, resultId);
+    this.log(`applied review ${resultId} to ${taskId}: ${review.verdict}`);
+  }
+
+  async #writeComment(task, body) {
     let commentId = task.comment_id;
     if (commentId) {
       try {
@@ -60,19 +83,16 @@ export class Worker {
       } catch (err) {
         // The remembered comment is gone (deleted, or an id from another repo). Look it up again.
         if (err.status !== 404) throw err;
-        this.log(`comment ${commentId} for ${event.task_id} not found; looking it up again`);
-        this.store.setTaskComment(event.task_id, null);
+        this.log(`comment ${commentId} for ${task.task_id} not found; looking it up again`);
+        this.store.setTaskComment(task.task_id, null);
         commentId = null;
       }
     }
     if (!commentId) {
-      commentId = await this.github.findProgressComment(task.issue_number, event.task_id);
+      commentId = await this.github.findProgressComment(task.issue_number, task.task_id);
       if (!commentId) commentId = await this.github.createComment(task.issue_number, body);
       else await this.github.updateComment(commentId, body);
-      this.store.setTaskComment(event.task_id, commentId);
+      this.store.setTaskComment(task.task_id, commentId);
     }
-    this.store.setTaskApplied(event.task_id, event.ts);
-    this.store.markDone(event.event_id);
-    this.log(`applied ${event.event_id} to ${event.task_id}`);
   }
 }

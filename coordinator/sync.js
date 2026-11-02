@@ -16,8 +16,8 @@ export async function syncTasks({ store, github, log = () => {} }) {
     const wanted = labels.find((l) => l.startsWith(ASSIGN_PREFIX))?.slice(ASSIGN_PREFIX.length) ?? null;
     let assignee = null;
     if (wanted) {
-      if (store.hasActiveDevice(wanted)) assignee = wanted;
-      else log(`issue #${issue.number}: label names unknown or revoked device "${wanted}"; leaving it unassigned`);
+      if (store.isActiveBuilder(wanted)) assignee = wanted;
+      else log(`issue #${issue.number}: label names unknown, revoked or non-builder device "${wanted}"; leaving it unassigned`);
     }
     const existing = store.getTaskByIssue(issue.number);
     if (existing && existing.source !== 'github') continue; // added by hand: the operator owns it

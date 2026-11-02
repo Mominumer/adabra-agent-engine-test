@@ -1,14 +1,17 @@
 import { DatabaseSync } from 'node:sqlite';
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
+import { verdictOf } from '../shared/review-result.js';
 
 const sha256 = (s) => createHash('sha256').update(s).digest('hex');
 
 export const MAX_ATTEMPTS = 8;
+export const ROLES = ['builder', 'reviewer']; // a device has exactly one, for life: a builder cannot become a reviewer
 
 export class Store {
   constructor(path) {
     this.db = new DatabaseSync(path);
     this.db.exec(`
+      PRAGMA busy_timeout = 5000;
       PRAGMA journal_mode = WAL;
       PRAGMA synchronous = FULL;
       CREATE TABLE IF NOT EXISTS devices (
@@ -44,18 +47,51 @@ export class Store {
         expires_at INTEGER NOT NULL,
         state TEXT NOT NULL            -- held | released | cancelled
       );
+      -- Every result accepted from a reviewer, so a re-delivery is recognised whatever has happened since.
+      CREATE TABLE IF NOT EXISTS review_results (
+        result_id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL,
+        device_id TEXT NOT NULL,
+        payload TEXT NOT NULL,
+        payload_hash TEXT NOT NULL,
+        applied INTEGER NOT NULL,      -- 0 = older than what the task already showed; never shown
+        received_at TEXT NOT NULL
+      );
+      -- The result each task shows, and whether that still has to reach the task's GitHub comment.
+      CREATE TABLE IF NOT EXISTS task_reviews (
+        task_id TEXT PRIMARY KEY,
+        result_id TEXT NOT NULL,
+        commit_seen_at INTEGER NOT NULL,
+        reviewed_at INTEGER NOT NULL,
+        comment_pending INTEGER NOT NULL DEFAULT 1,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        next_attempt_at INTEGER NOT NULL DEFAULT 0,
+        last_error TEXT
+      );
+      CREATE INDEX IF NOT EXISTS task_reviews_due ON task_reviews (comment_pending, next_attempt_at);
     `);
-    // Databases created before a column existed: add it.
-    const cols = this.db.prepare('PRAGMA table_info(tasks)').all().map((c) => c.name);
-    for (const [name, ddl] of [
-      ['generation', 'INTEGER NOT NULL DEFAULT 0'],
-      ['title', 'TEXT'],
-      ['assignee', 'TEXT'], // device_id this task is reserved for; NULL = anyone
-      ['closed', 'INTEGER NOT NULL DEFAULT 0'],
-      ['source', "TEXT NOT NULL DEFAULT 'manual'"], // 'github' = kept in step with the issue by task-sync
-    ]) {
-      if (!cols.includes(name)) this.db.exec(`ALTER TABLE tasks ADD COLUMN ${name} ${ddl}`);
-    }
+    // Databases created before a column existed: add it. Existing rows keep working: every device there is a builder.
+    // One transaction, so two processes opening an old database together cannot both try.
+    this.#tx(() => {
+      for (const [table, columns] of [
+        ['tasks', [
+          ['generation', 'INTEGER NOT NULL DEFAULT 0'],
+          ['title', 'TEXT'],
+          ['assignee', 'TEXT'], // device_id this task is reserved for; NULL = anyone
+          ['closed', 'INTEGER NOT NULL DEFAULT 0'],
+          ['source', "TEXT NOT NULL DEFAULT 'manual'"], // 'github' = kept in step with the issue by task-sync
+          ['returned_to', 'TEXT'], // device a failed review sent this back to; see recordReviewResult
+        ]],
+        ['devices', [
+          ['role', "TEXT NOT NULL DEFAULT 'builder'"],
+        ]],
+      ]) {
+        const cols = this.db.prepare(`PRAGMA table_info(${table})`).all().map((c) => c.name);
+        for (const [name, ddl] of columns) {
+          if (!cols.includes(name)) this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${name} ${ddl}`);
+        }
+      }
+    });
   }
 
   // --- claims ------------------------------------------------------------
@@ -92,8 +128,10 @@ export class Store {
         }
         return { ok: false, reason: 'claimed', owner: cur.device_id, expires_at: cur.expires_at };
       }
+      if (this.#returnBlocks(task, deviceId)) return { ok: false, reason: 'returned', owner: task.returned_to };
       const generation = task.generation + 1;
-      this.db.prepare('UPDATE tasks SET generation = ? WHERE task_id = ?').run(generation, taskId);
+      // A new claim is someone picking the task up, which is what the return was asking for: it has done its job.
+      this.db.prepare('UPDATE tasks SET generation = ?, returned_to = NULL WHERE task_id = ?').run(generation, taskId);
       this.db
         .prepare(
           "INSERT INTO claims (task_id, device_id, run_id, generation, expires_at, state) VALUES (?, ?, ?, ?, ?, 'held') " +
@@ -137,7 +175,7 @@ export class Store {
     return this.#tx(() => {
       const task = this.getTask(taskId);
       if (!task) return { ok: false, reason: 'unknown_task' };
-      this.db.prepare('UPDATE tasks SET generation = generation + 1 WHERE task_id = ?').run(taskId);
+      this.db.prepare('UPDATE tasks SET generation = generation + 1, returned_to = NULL WHERE task_id = ?').run(taskId);
       this.db.prepare("UPDATE claims SET state = 'cancelled' WHERE task_id = ?").run(taskId);
       return { ok: true, generation: task.generation + 1 };
     });
@@ -172,13 +210,147 @@ export class Store {
     this.db.close();
   }
 
+  // --- review results ----------------------------------------------------
+  // How a failed review "returns the task to its owner": a reservation, not a claim. The result never grants, renews,
+  // cancels or moves a lease and never changes the generation, so a reviewer cannot affect who may write checkpoints.
+  // While a task is returned nobody else can claim it, and the owner sees it first and claims it the normal way, which
+  // gets a new generation and ends the reservation. It also ends with a passing review, and when an operator steps in.
+  //
+  // The owner is the device the operator reserved the task for, else whoever holds the live lease, else whoever claimed
+  // it last (they may have released, or their lease lapsed). A revoked device, or one whose claim an operator cancelled,
+  // owns nothing; with no owner the result is still shown, but anyone may claim the task.
+  #reviewOwner(task, now) {
+    const c = this.#claimRow(task.task_id);
+    const holder = c && c.state === 'held' && c.expires_at > now ? c.device_id : null;
+    const last = c && c.state !== 'cancelled' ? c.device_id : null;
+    return [task.assignee, holder, last].find((d) => d && this.isActiveBuilder(d)) ?? null;
+  }
+
+  // Does a return keep this device from claiming the task? The device the operator reserved it for always may claim it,
+  // and a revoked device cannot hold a task hostage.
+  #returnBlocks(task, deviceId) {
+    return Boolean(task.returned_to) && task.returned_to !== deviceId && task.assignee !== deviceId && this.isActiveBuilder(task.returned_to);
+  }
+
+  #shownResult(taskId) {
+    const row = this.db
+      .prepare('SELECT r.payload FROM task_reviews t JOIN review_results r ON r.result_id = t.result_id WHERE t.task_id = ?')
+      .get(taskId);
+    return row ? JSON.parse(row.payload) : null;
+  }
+
+  // Committed (synchronous=FULL) before this returns, so the caller may acknowledge. Returns { outcome }:
+  //   unknown_task  no such task
+  //   conflict      this result id was already used with a different payload
+  //   duplicate     seen before: nothing happens, so a late re-delivery cannot return a task its owner has picked up again
+  //   stale         older than what the task shows (an older commit, or an older review of the same commit): kept, not shown
+  //   accepted      now what the task shows
+  recordReviewResult(result, deviceId, now) {
+    const payload = JSON.stringify(result);
+    const payloadHash = sha256(payload);
+    return this.#tx(() => {
+      const task = this.getTask(result.task_id);
+      if (!task) return { outcome: 'unknown_task' };
+      const seen = this.db.prepare('SELECT payload_hash FROM review_results WHERE result_id = ?').get(result.result_id);
+      if (seen) return { outcome: seen.payload_hash === payloadHash ? 'duplicate' : 'conflict' };
+
+      const cur = this.db.prepare('SELECT commit_seen_at, reviewed_at FROM task_reviews WHERE task_id = ?').get(result.task_id);
+      const newer =
+        !cur ||
+        result.commit_seen_at > cur.commit_seen_at ||
+        (result.commit_seen_at === cur.commit_seen_at && result.reviewed_at > cur.reviewed_at);
+      this.db
+        .prepare(
+          'INSERT INTO review_results (result_id, task_id, device_id, payload, payload_hash, applied, received_at) ' +
+            'VALUES (?, ?, ?, ?, ?, ?, ?)',
+        )
+        .run(result.result_id, result.task_id, deviceId, payload, payloadHash, newer ? 1 : 0, new Date().toISOString());
+      if (!newer) return { outcome: 'stale' };
+
+      this.db
+        .prepare(
+          'INSERT INTO task_reviews (task_id, result_id, commit_seen_at, reviewed_at) VALUES (?, ?, ?, ?) ' +
+            'ON CONFLICT(task_id) DO UPDATE SET result_id = excluded.result_id, commit_seen_at = excluded.commit_seen_at, ' +
+            'reviewed_at = excluded.reviewed_at, comment_pending = 1, attempts = 0, next_attempt_at = 0, last_error = NULL',
+        )
+        .run(result.task_id, result.result_id, result.commit_seen_at, result.reviewed_at);
+
+      // 'error' says nothing about the work, so it leaves any return as it stands.
+      const verdict = verdictOf(result);
+      let returnedTo = task.returned_to;
+      if (verdict === 'passed') returnedTo = null;
+      if (verdict === 'changes_requested') returnedTo = task.closed ? null : this.#reviewOwner(task, now);
+      this.db.prepare('UPDATE tasks SET returned_to = ? WHERE task_id = ?').run(returnedTo, result.task_id);
+      return { outcome: 'accepted', verdict, returned_to: returnedTo };
+    });
+  }
+
+  // What the task's GitHub comment shows. Its free text is still raw: renderComment makes it inert.
+  reviewForComment(taskId) {
+    const result = this.#shownResult(taskId);
+    return result ? { ...result, verdict: verdictOf(result), returned_to: this.getTask(taskId).returned_to } : null;
+  }
+
+  // What a task list shows, and so what a builder agent reads and may act on. Validated fields only: none of a review's
+  // free text (summaries, finding messages) ever goes this way, so it cannot be taken for instructions.
+  reviewBrief(taskId) {
+    const r = this.#shownResult(taskId);
+    if (!r) return null;
+    return {
+      verdict: verdictOf(r),
+      sha: r.sha,
+      pr: r.pr,
+      tests: r.tests,
+      review: r.review,
+      findings_total: r.findings_total,
+      findings: r.findings.map(({ severity, file, line }) => ({ severity, file, line })),
+    };
+  }
+
+  dueReviewComments(nowMs, limit = 50) {
+    return this.db
+      .prepare('SELECT task_id, result_id FROM task_reviews WHERE comment_pending = 1 AND next_attempt_at <= ? ORDER BY next_attempt_at LIMIT ?')
+      .all(nowMs, limit);
+  }
+
+  // Only if this is still the result on show: one that arrived while GitHub was being written to still needs its turn.
+  reviewCommentDone(taskId, resultId) {
+    this.db
+      .prepare('UPDATE task_reviews SET comment_pending = 0, attempts = 0, last_error = NULL WHERE task_id = ? AND result_id = ?')
+      .run(taskId, resultId);
+  }
+
+  // Keeps trying for as long as it takes: an outage must not leave a task showing the wrong verdict.
+  reviewCommentFailed(taskId, resultId, error, nowMs) {
+    const row = this.db.prepare('SELECT attempts FROM task_reviews WHERE task_id = ? AND result_id = ?').get(taskId, resultId);
+    if (!row) return;
+    this.db
+      .prepare('UPDATE task_reviews SET attempts = ?, next_attempt_at = ?, last_error = ? WHERE task_id = ?')
+      .run(row.attempts + 1, nowMs + Math.min(300_000, 2000 * 2 ** (row.attempts + 1)), String(error).slice(0, 500), taskId);
+  }
+
+  // The checkpoint the task's comment shows, so writing a review result does not wipe it.
+  lastAppliedEvent(taskId) {
+    const task = this.getTask(taskId);
+    if (!task?.applied_ts) return null;
+    const row = this.db
+      .prepare("SELECT payload FROM events WHERE task_id = ? AND ts = ? AND status = 'done' LIMIT 1")
+      .get(taskId, task.applied_ts);
+    return row ? JSON.parse(row.payload) : null;
+  }
+
   // --- devices -----------------------------------------------------------
-  addDevice(deviceId) {
+  addDevice(deviceId, role = 'builder') {
+    if (!ROLES.includes(role)) throw new Error(`unknown role ${role}`);
     const token = randomBytes(32).toString('hex');
     this.db
-      .prepare('INSERT INTO devices (device_id, token_hash) VALUES (?, ?)')
-      .run(deviceId, sha256(token));
+      .prepare('INSERT INTO devices (device_id, token_hash, role) VALUES (?, ?, ?)')
+      .run(deviceId, sha256(token), role);
     return token; // shown once, never stored in clear
+  }
+
+  deviceRole(deviceId) {
+    return this.db.prepare('SELECT role FROM devices WHERE device_id = ?').get(deviceId)?.role ?? null;
   }
 
   // Issue a new token for an existing device (lost or mis-copied token); the old one stops working.
@@ -225,13 +397,15 @@ export class Store {
   }
 
   // Reserve a task for one device (or null for anyone). Does not disturb a claim already held.
+  // This is the operator deciding who works on it, so it also ends a return (the way out if the owner has gone away).
   assignTask(taskId, deviceId) {
     if (!this.getTask(taskId)) return { ok: false, reason: 'unknown_task' };
     if (deviceId !== null) {
-      const d = this.db.prepare('SELECT revoked FROM devices WHERE device_id = ?').get(deviceId);
+      const d = this.db.prepare('SELECT revoked, role FROM devices WHERE device_id = ?').get(deviceId);
       if (!d || d.revoked) return { ok: false, reason: 'unknown_device' };
+      if (d.role !== 'builder') return { ok: false, reason: 'not_a_builder' };
     }
-    this.db.prepare('UPDATE tasks SET assignee = ? WHERE task_id = ?').run(deviceId, taskId);
+    this.db.prepare('UPDATE tasks SET assignee = ?, returned_to = NULL WHERE task_id = ?').run(deviceId, taskId);
     return { ok: true };
   }
 
@@ -246,31 +420,36 @@ export class Store {
       .run(taskId, issueNumber, title, assignee, closed ? 1 : 0);
   }
 
-  hasActiveDevice(deviceId) {
-    const d = this.db.prepare('SELECT revoked FROM devices WHERE device_id = ?').get(deviceId);
-    return Boolean(d && !d.revoked);
+  isActiveBuilder(deviceId) {
+    const d = this.db.prepare('SELECT revoked, role FROM devices WHERE device_id = ?').get(deviceId);
+    return Boolean(d && !d.revoked && d.role === 'builder');
   }
 
-  // What this device can work on: open tasks reserved for it, then open unreserved ones; oldest issue first.
-  // `state`: yours (you hold the live lease) | available | busy (someone else holds a live lease).
+  // What this device can work on: open tasks returned to it, then reserved for it, then open unreserved ones; oldest issue first.
+  // `state`: yours (you hold the live lease) | available | busy (someone else holds a live lease)
+  //        | returned (a failed review sent it back to another device, named in `returned_to`).
   tasksFor(deviceId, now) {
     const rows = this.db
       .prepare(
-        'SELECT task_id, issue_number, title, assignee FROM tasks ' +
+        'SELECT task_id, issue_number, title, assignee, returned_to FROM tasks ' +
           'WHERE closed = 0 AND (assignee = ? OR assignee IS NULL) ' +
-          'ORDER BY (assignee IS NULL), issue_number',
+          'ORDER BY (returned_to IS NOT ?), (assignee IS NULL), issue_number',
       )
-      .all(deviceId);
+      .all(deviceId, deviceId);
     return rows.map((t) => {
       const c = this.#claimRow(t.task_id);
       const live = c && c.state === 'held' && c.expires_at > now;
+      const blocked = this.#returnBlocks(t, deviceId);
       return {
         task_id: t.task_id,
         issue: t.issue_number,
         title: t.title,
         reserved_for_you: t.assignee === deviceId,
-        state: !live ? 'available' : c.device_id === deviceId ? 'yours' : 'busy',
+        returned_to_you: t.returned_to === deviceId,
+        state: live ? (c.device_id === deviceId ? 'yours' : 'busy') : blocked ? 'returned' : 'available',
         held_by: live ? c.device_id : null,
+        returned_to: blocked ? t.returned_to : null,
+        review: this.reviewBrief(t.task_id),
       };
     });
   }

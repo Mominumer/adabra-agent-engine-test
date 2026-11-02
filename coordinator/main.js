@@ -2,7 +2,7 @@
 // Coordinator entry point (runs on the Mac mini).
 //
 //   node coordinator/main.js serve
-//   node coordinator/main.js device-add <device-id>      (prints the token once)
+//   node coordinator/main.js device-add <device-id> [builder|reviewer]   (prints the token once; default builder)
 //   node coordinator/main.js device-rotate <device-id>   (new token; the old one stops working)
 //   node coordinator/main.js device-revoke <device-id>
 //   node coordinator/main.js task-add <TASK-1> <issue-number> [device-id]   (optionally reserved for a device)
@@ -20,7 +20,8 @@
 //   GITHUB_TOKEN_FILE       file containing a fine-grained token (never pass the token on the command line)
 //   GITHUB_DRY_RUN=1        log what would be posted instead of calling GitHub
 import { readFileSync } from 'node:fs';
-import { Store } from './store.js';
+import { ROLES, Store } from './store.js';
+import { VERDICT_TEXT } from '../shared/review-result.js';
 import { GitHubClient } from './github.js';
 import { Worker } from './worker.js';
 import { createServer } from './server.js';
@@ -31,12 +32,13 @@ const [cmd, ...args] = process.argv.slice(2);
 const store = new Store(process.env.COORDINATOR_DB ?? './coordinator.db');
 
 function usage() {
-  console.error('usage: main.js serve | device-add <id> | device-revoke <id> | task-add <TASK-N> <issue> | status');
+  console.error('usage: main.js serve | device-add <id> [builder|reviewer] | device-revoke <id> | task-add <TASK-N> <issue> | status');
   process.exit(2);
 }
 
-if (cmd === 'device-add' && args[0]) {
-  console.log(`device ${args[0]} token (shown once, store it on that device only):\n${store.addDevice(args[0])}`);
+if (cmd === 'device-add' && args[0] && (!args[1] || ROLES.includes(args[1]))) {
+  const role = args[1] ?? 'builder';
+  console.log(`device ${args[0]}, role ${role}, token (shown once, store it on that device only):\n${store.addDevice(args[0], role)}`);
 } else if (cmd === 'device-rotate' && args[0]) {
   console.log(`device ${args[0]} new token (shown once; the old token no longer works):\n${store.rotateDevice(args[0])}`);
 } else if (cmd === 'device-revoke' && args[0]) {
@@ -56,9 +58,12 @@ if (cmd === 'device-add' && args[0]) {
   for (const t of store.db.prepare('SELECT * FROM tasks ORDER BY issue_number').all()) {
     const c = store.currentClaim(t.task_id);
     const live = c && c.state === 'held' && c.expires_at > Date.now();
+    const review = store.reviewBrief(t.task_id);
     console.log(
       `${t.task_id} (#${t.issue_number}) ${t.closed ? 'CLOSED' : 'open'} ${t.source}: ` +
-        `${t.assignee ? `reserved for ${t.assignee}` : 'anyone'}, ${live ? `held by ${c.device_id}` : 'not held'}${t.title ? ` - ${t.title}` : ''}`,
+        `${t.assignee ? `reserved for ${t.assignee}` : 'anyone'}, ${live ? `held by ${c.device_id}` : 'not held'}` +
+        `${t.returned_to ? `, returned to ${t.returned_to}` : ''}` +
+        `${review ? `, ${VERDICT_TEXT[review.verdict]} on ${review.sha.slice(0, 12)}` : ''}${t.title ? ` - ${t.title}` : ''}`,
     );
   }
 } else if (cmd === 'task-sync') {

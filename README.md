@@ -110,6 +110,46 @@ node reviewer/main.js retry <pr>          # run a PR's latest commit again
 
 Only PRs from branches of this repo, by authors in `REVIEW_AUTHORS`, and not drafts, are run.
 
+## Review results on tasks
+
+When the reviewer finishes a PR that belongs to a task, the coordinator learns the result: the task's progress comment
+shows `review passed`, `changes requested` with a summary of the findings, or `review could not complete`, and
+`node helper/cli.js tasks` shows it too. A PR belongs to a task if its branch is exactly `task/TASK-7` or its description has a
+line reading exactly `Task: TASK-7`. A PR that names two different tasks is linked to neither.
+
+Text from a review is untrusted, because it can quote the code under review. The progress comment shows it only inside a
+labelled code block, where Markdown, images, links and mentions do nothing. `tasks` is read by builder agents, so it never
+carries that text at all: only the verdict, severity (one of a closed list), location (a path with no spaces, and a line) and
+counts, with a note saying where the details are and what they are.
+
+```
+reviewer: statuses and PR comment posted -> result saved in reviewer.db with the job -> POST /v1/review-results (own timer, retried)
+coordinator: stored durably, acks -> worker updates the task's ONE progress comment (retried)
+```
+
+The reviewer posts as its own enrolled device. Devices have a role, fixed when they are added: only a `reviewer` may post
+results, and only a `builder` may claim tasks, write checkpoints or list tasks. The coordinator alone holds the GitHub token
+that writes to the task's issue.
+
+```bash
+node coordinator/main.js device-add mini-reviewer reviewer     # prints the token once
+umask 077; read -rs T; printf %s "$T" > ~/.adabra/reviewer-device-token; unset T   # paste token, Enter
+REVIEW_DEVICE_ID=mini-reviewer REVIEW_COORDINATOR_URL=http://127.0.0.1:8787 REVIEW_AUTHORS=... REVIEW_IMAGE=... \
+  service/reviewer-service.sh install
+node reviewer/main.js status                                   # also lists results that are not delivered
+```
+
+Without `REVIEW_DEVICE_ID` the feature is off (the log says so) and reviews run exactly as before. Results wait in
+`reviewer.db` for as long as the coordinator is away, or its token or role is wrong; they are dropped only when the
+coordinator refuses them for good, such as for an unknown task. A result for an older commit never replaces one for a newer
+commit, and a re-delivered result changes nothing.
+
+A failed review **returns** the task to its owner. That is a reservation, not a claim: no lease or claim generation changes.
+Others are refused (`a failed review returned it to member-a`), and the owner sees it first in `tasks` and claims it as usual,
+which ends the reservation. The owner is the device the task is reserved for, else whoever holds the live lease, else whoever
+claimed it last, even if they have released. A passing review also ends it. If the owner has gone away, revoking the device
+ends it, as does `node coordinator/main.js task-assign TASK-7 <device-id|none>`.
+
 ## Not built yet (by design)
 
 Claim/lease validation (`claim_generation` is carried but not checked), cancellation, review workers, context

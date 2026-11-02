@@ -1,5 +1,6 @@
 import http from 'node:http';
 import { validateEvent } from '../shared/event.js';
+import { validateReviewResult } from '../shared/review-result.js';
 
 const MAX_BODY = 16 * 1024;
 export const DEFAULT_LEASE_MS = 180_000; // claim expires after 3 min without renewal
@@ -57,6 +58,11 @@ export function createServer({ store, log = () => {}, now = () => Date.now(), le
     return send(res, code, { error: r.reason, owner: r.owner, expires_at: r.expires_at });
   };
 
+  const refuseRole = (res, deviceId, needed) => {
+    log(`403 device=${String(deviceId).slice(0, 40)}: needs role ${needed}`);
+    return send(res, 403, { error: `this needs a ${needed} device` });
+  };
+
   return http.createServer(async (req, res) => {
     try {
       if (req.method === 'GET' && req.url === '/healthz') return send(res, 200, { ok: true });
@@ -68,6 +74,7 @@ export function createServer({ store, log = () => {}, now = () => Date.now(), le
           log(`401 device=${String(deviceId).slice(0, 40)}`);
           return send(res, 401, { error: 'unauthorized' });
         }
+        if (store.deviceRole(deviceId) !== 'builder') return refuseRole(res, deviceId, 'builder');
         return send(res, 200, { tasks: store.tasksFor(deviceId, now()) });
       }
 
@@ -79,6 +86,28 @@ export function createServer({ store, log = () => {}, now = () => Date.now(), le
           log(`401 device=${String(deviceId).slice(0, 40)}`);
           return send(res, 401, { error: 'unauthorized' });
         }
+
+        // Roles are separate on purpose: a builder cannot pass its own review, and a reviewer cannot act as a builder.
+        // Decided here, before the body is read, with everything that is not for reviewers open to builders only.
+        const role = store.deviceRole(deviceId);
+        if (req.url === '/v1/review-results') {
+          if (role !== 'reviewer') return refuseRole(res, deviceId, 'reviewer');
+          let result;
+          try {
+            result = JSON.parse(await readBody(req));
+          } catch (err) {
+            if (err.code === 413) return send(res, 413, { error: 'body too large' });
+            return send(res, 400, { error: 'invalid JSON' });
+          }
+          const errors = validateReviewResult(result);
+          if (errors.length) return send(res, 400, { error: 'invalid review result', details: errors });
+          const r = store.recordReviewResult(result, deviceId, now());
+          log(`review ${result.result_id} task=${result.task_id} pr=${result.pr} device=${deviceId}: ${r.outcome}${r.verdict ? ` ${r.verdict}` : ''}${r.returned_to ? ` returned to ${r.returned_to}` : ''}`);
+          if (r.outcome === 'unknown_task') return send(res, 422, { error: `unknown task ${result.task_id}` });
+          if (r.outcome === 'conflict') return send(res, 409, { error: 'result_id already used with a different payload' });
+          return send(res, 200, { status: r.outcome, result_id: result.result_id });
+        }
+        if (role !== 'builder') return refuseRole(res, deviceId, 'builder');
 
         if (req.url === '/v1/claims') {
           const b = await claimBody(req, res, { needGeneration: false });
