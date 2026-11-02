@@ -3,6 +3,8 @@ import { join } from 'node:path';
 import { parseArgs } from 'node:util';
 import { isStopped as stopInForce } from '../shared/stop.js';
 import { hasTerminal, typed } from '../shared/terminal.js';
+import { HARD_CEILING, hardFacts, hardNumbers, hardOutcome, printHard } from './hard-score.js';
+import { hardCases, HARD_SET_VERSION } from './hard-set.js';
 import { JOB_ROOT } from './job-dir.js';
 import { parseStream, shapeDifferences, shapeFacts } from './output-shape.js';
 import { agreedToSpend, appendLocal, findingAt, openServiceStore, runsDir, saveLocal, spendRefusal } from './paid-tools.js';
@@ -41,14 +43,14 @@ function outcomeOf(c, { state, findings }) {
   return here.length ? 'noted-not-blocked' : 'missed';
 }
 
-// Where a case stands, from the database alone, so a resumed run and a stopped one report the same way.
-export function caseState(runs, c) {
+// Where a case stands, from the database alone, so a resumed run and a stopped one report the same way. `score` is what a valid answer means.
+export function caseState(runs, c, score = outcomeOf) {
   const rows = runs.reviewRuns(c.pr, c.sha);
   const total = (field) => rows.reduce((sum, r) => sum + (r[field] ?? 0), 0);
   const attempts = rows.filter((r) => r.paid && !NOT_THE_CASES_FAULT.has(r.outcome)).length;
   const seen = { name: c.name, kind: c.kind, attempts, runs: rows.length, paidRuns: rows.filter((r) => r.paid).length, cost: total('cost_usd'), turns: total('num_turns'), durationMs: total('duration_ms') };
   const valid = runs.cachedReview({ pr: c.pr, sha: c.sha, skill: SKILL, model: MODEL });
-  if (valid) return { ...seen, finished: true, outcome: outcomeOf(c, valid), state: valid.state, findings: valid.findings };
+  if (valid) return { ...seen, finished: true, outcome: score(c, valid), state: valid.state, findings: valid.findings };
   const last = rows.at(-1);
   if (!last || NOT_THE_CASES_FAULT.has(last.outcome)) return { ...seen, finished: false, outcome: 'not-run' };
   const errorClass = last.outcome ?? 'unfinished';
@@ -57,11 +59,14 @@ export function caseState(runs, c) {
 
 export const paidSoFar = (runs, cases) => cases.reduce((sum, c) => sum + caseState(runs, c).paidRuns, 0);
 
+// The hard set's state: the same record, scored its own stricter way.
+export const hardState = (runs, c) => hardFacts(c, caseState(runs, c, hardOutcome));
+
 // Goes through the cases that still need an answer, and stops at the first reason not to spend any more. Returns { stoppedBy, shape }.
 // runs: this set's own database. service: the service's, for its pause, and to tell it of a limit, as the account is the same one.
 export async function seededRun({
   cases = seededCases(), sandbox, service, runs, runner, root = JOB_ROOT, now = Date.now, isStopped = stopInForce, ceiling = SEEDED_CEILING,
-  log = () => {}, onRaw = () => {}, onCase = () => {},
+  stateOf = caseState, log = () => {}, onRaw = () => {}, onCase = () => {},
 }) {
   let last = null;
   const recording = async (id) => {
@@ -84,7 +89,7 @@ export async function seededRun({
   let stoppedBy = null;
   let errorsInARow = 0;
   for (const c of cases) {
-    const before = caseState(runs, c);
+    const before = stateOf(runs, c);
     if (before.finished) continue;
     stoppedBy = whyNotSpend();
     if (stoppedBy) break;
@@ -108,7 +113,7 @@ export async function seededRun({
         log(`${c.name}: ${err.message}`);
       }
     }
-    const after = caseState(runs, c);
+    const after = stateOf(runs, c);
     if (after.outcome === 'error' && last) {
       const parsed = parseStream(last.stdout);
       const differs = shapeDifferences(parsed, { stream: false });
@@ -184,21 +189,31 @@ export function printSeeded(states, { stoppedBy = null, shape = [], saved = [] }
   if (stoppedBy) say(`Stopped by ${stoppedBy}. What it had is kept, and running the same command again pays for nothing it has already answered.`);
 }
 
-// The command. --run-name keeps a later run apart from this one, for after a change of CLI, model or skill.
+// The sets it can run. v1 stays as it was, so its numbers stay comparable and its files stay where they are. The hard set's files have their own
+// prefix, which no --run-name can make, so neither set can ever open the other's database or overwrite its results.
+const SETS = {
+  v1: { version: SET_VERSION, prefix: 'seeded', cases: seededCases, ceiling: SEEDED_CEILING, stateOf: caseState, numbers: seededNumbers, print: printSeeded },
+  hard: { version: HARD_SET_VERSION, prefix: 'hard-set', cases: hardCases, ceiling: HARD_CEILING, stateOf: hardState, numbers: hardNumbers, print: printHard },
+};
+
+// The command. --set chooses the set. --run-name keeps a later run apart from this one, for after a change of CLI, model or skill.
 export async function seededCommand({
-  args, sandbox, env = process.env, opt = OPT, sudo, root, now = Date.now, deadlineMs, stop, isStopped, cases = seededCases(), ceiling = SEEDED_CEILING,
+  args, sandbox, env = process.env, opt = OPT, sudo, root, now = Date.now, deadlineMs, stop, isStopped, cases: givenCases = null, ceiling: givenCeiling = null,
   terminal = hasTerminal(), confirm = typed, say = console.log,
 }) {
   let flags;
   try {
-    flags = parseArgs({ args, options: { yes: { type: 'boolean', default: false }, 'run-name': { type: 'string', default: 'default' } } }).values;
+    flags = parseArgs({ args, options: { yes: { type: 'boolean', default: false }, set: { type: 'string', default: 'v1' }, 'run-name': { type: 'string', default: 'default' } } }).values;
   } catch {
     flags = null;
   }
-  if (!flags || !/^[a-z0-9-]{1,40}$/.test(flags['run-name'])) {
-    say('usage: seeded-run [--yes] [--run-name <lower-case-letters-digits-dashes>]');
+  if (!flags || !/^[a-z0-9-]{1,40}$/.test(flags['run-name']) || !Object.hasOwn(SETS, flags.set)) {
+    say('usage: seeded-run [--yes] [--set v1|hard] [--run-name <lower-case-letters-digits-dashes>]');
     return 2;
   }
+  const set = SETS[flags.set];
+  const cases = givenCases ?? set.cases();
+  const ceiling = givenCeiling ?? set.ceiling;
   if (!flags.yes && !terminal) {
     say(`seeded-run makes up to ${cases.length} paid runs, so it needs an interactive terminal or --yes. Nothing was spent.`);
     return 2;
@@ -209,20 +224,20 @@ export async function seededCommand({
   try {
     const dir = runsDir(env);
     service = openServiceStore({ env, opt });
-    const db = join(dir, `seeded-${name}.db`);
+    const db = join(dir, `${set.prefix}-${name}.db`);
     closeSync(openSync(db, 'a', 0o600)); // made private first, as SQLite gives its side files the same mode
     runs = new ReviewStore(db);
-    const states = () => cases.map((c) => caseState(runs, c));
-    const resultsFile = `seeded-${name}-results.json`;
+    const states = () => cases.map((c) => set.stateOf(runs, c));
+    const resultsFile = `${set.prefix}-${name}-results.json`;
     let stoppedBy = null;
     let shape = [];
     const writeResults = () => saveLocal(dir, resultsFile, JSON.stringify({
-      set: SET_VERSION, reviewer: `${MODEL}.${SKILL}`, at: new Date(now()).toISOString(), stoppedBy, shape, numbers: seededNumbers(states()), cases: states(),
+      set: set.version, reviewer: `${MODEL}.${SKILL}`, at: new Date(now()).toISOString(), stoppedBy, shape, numbers: set.numbers(states()), cases: states(),
     }, null, 2));
 
     const left = states().filter((s) => !s.finished).length;
     if (!left) {
-      printSeeded(states(), { saved: [writeResults()] }, say);
+      set.print(states(), { saved: [writeResults()] }, say);
       return 0;
     }
     const refusal = spendRefusal({ opt, store: service, now: now(), ...(stop ? { stop } : {}) });
@@ -234,17 +249,17 @@ export async function seededCommand({
     const room = ceiling - used;
     if (room <= 0) {
       say(`Refused: this named run has used its ceiling of ${ceiling} paid runs. Nothing was spent. Use --run-name for a new one.`);
-      printSeeded(states(), { saved: [writeResults()] }, say);
+      set.print(states(), { saved: [writeResults()] }, say);
       return 2;
     }
     const statement = `This makes at most ${Math.min(left, room)} paid runs of the real review: ${left} of ${cases.length} cases still need an answer, and this named run has used ${used} of its ceiling of ${ceiling}. `
       + 'It is outside the daily cap, and nothing is posted to GitHub. It stops at once on the emergency stop, a pause or an account limit.';
     if (!(await agreedToSpend({ yes: flags.yes, terminal, confirm, say, statement }))) return 1;
     await sandbox.ensureDocker();
-    const rawFile = join(dir, `seeded-${name}-raw.txt`);
-    const logFile = join(dir, `seeded-${name}.log`);
+    const rawFile = join(dir, `${set.prefix}-${name}-raw.txt`);
+    const logFile = join(dir, `${set.prefix}-${name}.log`);
     const r = await seededRun({
-      cases, sandbox, service, runs, now, ceiling,
+      cases, sandbox, service, runs, now, ceiling, stateOf: set.stateOf,
       runner: sudoRunner({ opt, ...(sudo ? { sudo } : {}), ...(deadlineMs ? { deadlineMs } : {}) }),
       ...(root ? { root } : {}), ...(isStopped ? { isStopped } : {}),
       log: (line) => appendLocal(logFile, `${new Date(now()).toISOString()} ${line}\n`),
@@ -255,7 +270,7 @@ export async function seededCommand({
       },
     });
     ({ stoppedBy, shape } = r);
-    printSeeded(states(), { stoppedBy, shape, saved: [writeResults(), rawFile, logFile] }, say);
+    set.print(states(), { stoppedBy, shape, saved: [writeResults(), rawFile, logFile] }, say);
     return stoppedBy ? 3 : 0;
   } catch (err) {
     say(`seeded-run could not finish: ${err.message}. What it had is kept.`);

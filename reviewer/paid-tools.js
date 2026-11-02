@@ -84,7 +84,7 @@ export async function agreedToSpend({ yes, terminal, confirm, say, statement }) 
 // Where a finding sits, as seen from the job directory, against where a defect is. Near enough, as a model may name the start of the
 // statement or function. Only ever compares: a finding's text is not looked at.
 export const LINE_WINDOW = 5;
-const treePath = (file, jobDir) => {
+export const treePath = (file, jobDir = null) => {
   if (typeof file !== 'string') return null;
   let p = file;
   if (jobDir && p.startsWith(`${jobDir}/`)) p = p.slice(jobDir.length + 1);
