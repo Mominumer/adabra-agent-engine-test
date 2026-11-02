@@ -181,6 +181,14 @@ export class Store {
     });
   }
 
+  // The operator's stop: keeps alive every lease that was live when the stop began, so refusing renewals costs nobody a claim.
+  // Owner and generation stay as they are. A lease that had already lapsed by then stays lapsed. See stop-keeper.js.
+  holdLeases(since, now, ttlMs) {
+    return this.db
+      .prepare("UPDATE claims SET expires_at = ? WHERE state = 'held' AND expires_at > ? AND expires_at < ?")
+      .run(now + ttlMs, since, now + ttlMs).changes;
+  }
+
   // An event is acceptable only from the current generation's owner. Fencing is by generation, not by
   // wall-clock expiry: an owner whose lease lapsed but who was never replaced may still report genuine work.
   eventMatchesClaim(event) {

@@ -24,8 +24,9 @@ import { parseArgs } from 'node:util';
 import { Outbox } from './outbox.js';
 import { flush } from './sender.js';
 import { validateEvent } from '../shared/event.js';
-import { ClaimFile, claimRefusal, claimTask, describeTask, heartbeat, listTasks, newRunId, releaseClaim } from './claims.js';
+import { ClaimFile, claimRefusal, claimTask, describeTask, getStop, heartbeat, listTasks, newRunId, releaseClaim } from './claims.js';
 import { readSecretFile, tokenSaveHint } from './platform.js';
+import { stopLine } from '../shared/stop.js';
 
 const home = process.env.TEAM_AGENT_HOME ?? join(homedir(), '.team-agent');
 const configPath = join(home, 'config.json');
@@ -65,6 +66,7 @@ if (cmd === 'enroll') {
     console.error(`could not list tasks: ${r.data.error ?? r.status}`);
     process.exit(1);
   }
+  if (r.data.stop?.stopped) console.log(`${stopLine(r.data.stop)}\nNothing can be claimed until the operator resumes. Claims already held are kept.`);
   if (!r.data.tasks.length) console.log('no open tasks for you');
   for (const t of r.data.tasks) console.log(describeTask(t));
 } else if (cmd === 'claim' || cmd === 'claim-next') {
@@ -132,7 +134,7 @@ if (cmd === 'enroll') {
   const left = outbox.counts().pending ?? 0;
   outbox.close();
   if (left) {
-    console.error(`${left} checkpoint(s) are still queued; not releasing. Flush them first.`);
+    console.error(`${left} checkpoint(s) are still queued; not releasing. Flush them first (after the operator resumes, if the system is stopped).`);
     process.exit(1);
   }
   const r = await releaseClaim({ url: cfg.coordinator_url, deviceId: cfg.device_id, token: cfg.token }, taskId, claim.run_id, claim.generation);
@@ -187,7 +189,9 @@ if (cmd === 'enroll') {
   console.log(`recorded ${event.event_id}`);
   const r = await flush({ outbox, url: cfg.coordinator_url, deviceId: cfg.device_id, token: cfg.token, log: console.error });
   console.log(
-    r.acked
+    r.stopped
+      ? `queued: ${stopLine(r.stopped)}. It stays in the outbox and is delivered after the operator resumes.`
+      : r.acked
       ? 'acknowledged by the coordinator'
       : r.rejected
         ? 'REJECTED by the coordinator (not retried): you may no longer hold this task; see the reason above'
@@ -204,13 +208,25 @@ if (cmd === 'enroll') {
   console.log('outbox:', outbox.counts());
   outbox.close();
   console.log('claims held:', Object.keys(claimFile.all()).join(', ') || 'none');
+  let agent = null;
   try {
-    const a = JSON.parse(readFileSync(join(home, 'agent-status.json'), 'utf8'));
-    const age = Math.round((Date.now() - Date.parse(a.at)) / 1000);
+    agent = JSON.parse(readFileSync(join(home, 'agent-status.json'), 'utf8'));
+    const age = Math.round((Date.now() - Date.parse(agent.at)) / 1000);
     console.log(`background agent: last pass ${age}s ago${age > 120 ? ' (NOT RUNNING? it should report every 30s)' : ''}`);
   } catch {
     console.log('background agent: no status file (not running)');
   }
+  // The coordinator's answer if it can be had, else what the agent saw last.
+  let live = null;
+  try {
+    const cfg = loadConfig();
+    const r = await getStop({ url: cfg.coordinator_url, deviceId: cfg.device_id, token: cfg.token, timeoutMs: 3000 });
+    if (r.ok || r.status === 404) live = r.ok ? r.data : { stopped: false };
+  } catch {
+    // Not enrolled, or the coordinator cannot be reached.
+  }
+  if (live?.stopped) console.log(`${stopLine(live)}\nClaims held are kept. Checkpoints wait in the outbox until the operator resumes.`);
+  else if (!live && agent?.stop) console.log(`${stopLine(agent.stop)} (as last seen by the background agent; the coordinator did not answer)`);
 } else {
   console.error('usage: cli.js enroll | checkpoint | flush | status');
   process.exit(2);

@@ -19,6 +19,7 @@
 //   GITHUB_REPO             owner/name
 //   GITHUB_TOKEN_FILE       file containing a fine-grained token (never pass the token on the command line)
 //   GITHUB_DRY_RUN=1        log what would be posted instead of calling GitHub
+//   ADABRA_STOP_FILE        the operator's emergency stop (default ~/.adabra-control/stop.json); see service/ops.sh
 import { readFileSync } from 'node:fs';
 import { ROLES, Store } from './store.js';
 import { VERDICT_TEXT } from '../shared/review-result.js';
@@ -26,10 +27,17 @@ import { GitHubClient } from './github.js';
 import { Worker } from './worker.js';
 import { createServer } from './server.js';
 import { syncTasks } from './sync.js';
+import { keepLeasesWhileStopped } from './stop-keeper.js';
+import { readStop, stopLine } from '../shared/stop.js';
 
 const log = (m) => console.log(`${new Date().toISOString()} ${m}`);
 const [cmd, ...args] = process.argv.slice(2);
 const store = new Store(process.env.COORDINATOR_DB ?? './coordinator.db');
+
+const showStop = () => {
+  const s = readStop();
+  if (s.stopped) console.log(stopLine(s));
+};
 
 function usage() {
   console.error('usage: main.js serve | device-add <id> [builder|reviewer] | device-revoke <id> | task-add <TASK-N> <issue> | status');
@@ -55,6 +63,7 @@ if (cmd === 'device-add' && args[0] && (!args[1] || ROLES.includes(args[1]))) {
   const r = store.assignTask(args[0], args[1] === 'none' ? null : args[1]);
   console.log(r.ok ? `${args[0]} is now ${args[1] === 'none' ? 'open to anyone' : `reserved for ${args[1]}`}` : `failed: ${r.reason}`);
 } else if (cmd === 'tasks') {
+  showStop();
   for (const t of store.db.prepare('SELECT * FROM tasks ORDER BY issue_number').all()) {
     const c = store.currentClaim(t.task_id);
     const live = c && c.state === 'held' && c.expires_at > Date.now();
@@ -73,6 +82,7 @@ if (cmd === 'device-add' && args[0] && (!args[1] || ROLES.includes(args[1]))) {
   const r = store.cancelClaim(args[0]);
   console.log(r.ok ? `cancelled ${args[0]}; generation is now ${r.generation}, the old owner's output is fenced` : `failed: ${r.reason}`);
 } else if (cmd === 'claims') {
+  showStop();
   for (const t of store.db.prepare('SELECT task_id, generation FROM tasks ORDER BY task_id').all()) {
     const c = store.currentClaim(t.task_id);
     console.log(
@@ -82,6 +92,7 @@ if (cmd === 'device-add' && args[0] && (!args[1] || ROLES.includes(args[1]))) {
     );
   }
 } else if (cmd === 'status') {
+  showStop();
   console.log(store.counts());
 } else if (cmd === 'serve') {
   let github;
@@ -96,18 +107,20 @@ if (cmd === 'device-add' && args[0] && (!args[1] || ROLES.includes(args[1]))) {
     const token = readFileSync(process.env.GITHUB_TOKEN_FILE, 'utf8').trim();
     github = new GitHubClient({ repo: process.env.GITHUB_REPO, token });
   }
-  const worker = new Worker({ store, github, log });
+  const worker = new Worker({ store, github, log, stopState: readStop });
   worker.start();
   const host = process.env.COORDINATOR_HOST ?? '127.0.0.1';
   const port = Number(process.env.COORDINATOR_PORT ?? 8787);
   const leaseMs = Number(process.env.COORDINATOR_LEASE_MS ?? 180_000);
+  // Before the first request, so a stop in force through a restart keeps the leases that ran out while this was down.
+  await keepLeasesWhileStopped({ store, leaseMs, log }).pass();
   if (process.env.GITHUB_DRY_RUN !== '1') {
     const syncEvery = Number(process.env.COORDINATOR_SYNC_MS ?? 60_000);
     const run = () => syncTasks({ store, github, log }).catch((err) => log(`task sync failed: ${err.message}`));
     run();
     setInterval(run, syncEvery).unref();
   }
-  createServer({ store, log, leaseMs }).listen(port, host, () => log(`coordinator listening on ${host}:${port}`));
+  createServer({ store, log, leaseMs, stopState: readStop }).listen(port, host, () => log(`coordinator listening on ${host}:${port}`));
 } else {
   usage();
 }

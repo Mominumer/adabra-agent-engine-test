@@ -132,7 +132,7 @@ export async function deliverResults({ store, url, deviceId, token, now = Date.n
 
 // Turns delivery on or off and says which. Delivery has its own timer, so a slow or absent coordinator never holds up the
 // review loop, and a 15-minute test run never holds up delivery.
-export function startTaskResults({ store, env = process.env, home = homedir(), log = () => {} }) {
+export function startTaskResults({ store, env = process.env, home = homedir(), log = () => {}, isStopped = () => false }) {
   const cfg = deliveryConfig(env, home);
   if (cfg.off) {
     log(`task results: off (${cfg.off}); reviews run as usual, tasks are not told the outcome`);
@@ -141,7 +141,7 @@ export function startTaskResults({ store, env = process.env, home = homedir(), l
   log(`task results: on, device ${cfg.deviceId}, coordinator ${cfg.origin}`);
   let busy = false;
   const pass = async () => {
-    if (busy) return;
+    if (busy || isStopped()) return; // the operator's stop: results stay pending, with no backoff, and go after resume
     busy = true;
     try {
       if (!store.dueTaskResults(Date.now()).length) return;
