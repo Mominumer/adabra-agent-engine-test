@@ -1,0 +1,41 @@
+{
+  "permissions": {
+    "deny": [
+      "Read(~/.adabra/**)",
+      "Read(~/.team-agent/token)",
+      "Read(~/.config/gh/**)",
+      "Read(**/*.db)",
+      "Read(**/*.db-wal)",
+      "Read(**/*.db-shm)",
+      "Bash(cat ~/.adabra/*)",
+      "Bash(cat ~/.team-agent/token)",
+      "Bash(gh auth token:*)",
+      "Bash(gh pr merge:*)",
+      "Bash(git push origin main:*)",
+      "Bash(git push --force:*)",
+      "Bash(git push -f:*)"
+    ],
+    "allow": [
+      "Bash(npm test)",
+      "Bash(node --test:*)",
+      "Bash(git status:*)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)",
+      "Bash(git fetch:*)",
+      "Bash(git worktree list:*)",
+      "Bash(gh pr checks:*)",
+      "Bash(gh pr view:*)",
+      "Bash(gh pr list:*)",
+      "Bash(gh issue view:*)",
+      "Bash(gh issue list:*)",
+      "Bash(node helper/cli.js status)",
+      "Bash(node helper/cli.js tasks)",
+      "Bash(node reviewer/main.js status)",
+      "Bash(node coordinator/main.js tasks)",
+      "Bash(node coordinator/main.js claims)",
+      "Bash(service/coordinator-service.sh status)",
+      "Bash(service/helper-service.sh status)",
+      "Bash(service/reviewer-service.sh status)"
+    ]
+  }
+}
