@@ -1,12 +1,15 @@
 import { renderComment } from './github.js';
+import { AUTH_HOLD_MS, upsertComment } from '../shared/github-auth.js';
+import { RUNNING } from '../shared/stop.js';
 
 // Applies stored events to GitHub. Retries with backoff; never regresses a task
 // to an older event (events are applied in timestamp order per task).
 export class Worker {
-  constructor({ store, github, log = () => {} }) {
+  constructor({ store, github, log = () => {}, stopState = () => RUNNING }) {
     this.store = store;
     this.github = github;
     this.log = log;
+    this.stopState = stopState;
     this.timer = null;
     this.running = false;
   }
@@ -23,6 +26,7 @@ export class Worker {
 
   async tick(now = Date.now()) {
     if (this.running) return;
+    if (this.stopState().stopped) return; // nothing goes to GitHub, and what is waiting uses up none of its attempts
     this.running = true;
     try {
       const failedTasks = new Set();
@@ -34,6 +38,12 @@ export class Worker {
           await this.#apply(event);
         } catch (err) {
           failedTasks.add(row.task_id);
+          // Our own credentials are out, which says nothing about this event: it waits, however long that takes, and no attempt is used.
+          if (err.authOutage) {
+            this.store.holdEvent(row.event_id, err.message, now + AUTH_HOLD_MS);
+            this.log(`held ${row.event_id}, not counted as an attempt: ${err.message}`);
+            continue;
+          }
           const dead = this.store.markFailed(row.event_id, err.message, now);
           this.log(`${dead ? 'DEAD' : 'retry'} ${row.event_id}: ${err.message}`);
         }
@@ -76,23 +86,14 @@ export class Worker {
   }
 
   async #writeComment(task, body) {
-    let commentId = task.comment_id;
-    if (commentId) {
-      try {
-        await this.github.updateComment(commentId, body);
-      } catch (err) {
-        // The remembered comment is gone (deleted, or an id from another repo). Look it up again.
-        if (err.status !== 404) throw err;
-        this.log(`comment ${commentId} for ${task.task_id} not found; looking it up again`);
-        this.store.setTaskComment(task.task_id, null);
-        commentId = null;
-      }
-    }
-    if (!commentId) {
-      commentId = await this.github.findProgressComment(task.issue_number, task.task_id);
-      if (!commentId) commentId = await this.github.createComment(task.issue_number, body);
-      else await this.github.updateComment(commentId, body);
-      this.store.setTaskComment(task.task_id, commentId);
-    }
+    const id = await upsertComment({
+      remembered: task.comment_id,
+      label: task.task_id,
+      log: this.log,
+      find: () => this.github.findProgressComment(task.issue_number, task.task_id),
+      update: (commentId) => this.github.updateComment(commentId, body),
+      create: () => this.github.createComment(task.issue_number, body),
+    });
+    if (id !== task.comment_id) this.store.setTaskComment(task.task_id, id);
   }
 }

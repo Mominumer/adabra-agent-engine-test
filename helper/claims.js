@@ -2,6 +2,7 @@ import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 import { findingLocation, VERDICT_TEXT } from '../shared/review-result.js';
+import { stopLine } from '../shared/stop.js';
 import { replaceFile, retryWhileShared } from './platform.js';
 
 // What this device believes it holds, kept in $TEAM_AGENT_HOME/claims.json.
@@ -63,37 +64,51 @@ export const renewClaim = (cfg, taskId, runId, generation) =>
 export const releaseClaim = (cfg, taskId, runId, generation) =>
   call({ ...cfg, path: '/v1/claims/release', body: { task_id: taskId, run_id: runId, generation } });
 
+// The operator's emergency stop: the claim is still ours, and the coordinator is keeping its lease alive. See stop-keeper.js.
+export const isStopResponse = (r) => r.status === 503 && r.data?.error === 'stopped';
+
 // Renews on an interval until the claim is lost or the signal aborts. Returns why it stopped.
-// A network error keeps retrying until the lease would have expired locally; a refusal stops at once.
+// A network error keeps retrying until the lease would have expired locally; a refusal stops at once. Being told the system
+// is stopped is neither: it waits, and while it knows of a stop it does not give up on an unreachable coordinator either.
 export async function heartbeat(cfg, taskId, claim, { intervalMs = 30_000, signal, log = () => {}, sleep = (ms, s) => new Promise((r) => { const t = setTimeout(r, ms); s?.addEventListener('abort', () => { clearTimeout(t); r(); }); }) } = {}) {
   let leaseUntil = claim.expires_at;
+  let stopped = false;
   while (!signal?.aborted) {
     await sleep(intervalMs, signal);
     if (signal?.aborted) break;
     try {
       const r = await renewClaim(cfg, taskId, claim.run_id, claim.generation);
       if (r.ok) {
+        stopped = false;
         leaseUntil = r.data.expires_at;
         log(`renewed ${taskId}, lease valid for ${Math.round((leaseUntil - Date.now()) / 1000)}s`);
+      } else if (isStopResponse(r)) {
+        stopped = true;
+        leaseUntil = r.data.expires_at ?? leaseUntil;
+        log(`${stopLine(r.data)}. The claim on ${taskId} is kept. Stop work until the operator resumes.`);
       } else {
         return { stopped: 'refused', reason: r.data.error ?? `http ${r.status}` };
       }
     } catch (err) {
       log(`renew failed (${err.cause?.code ?? err.message})`);
-      if (Date.now() >= leaseUntil) return { stopped: 'lease-lapsed', reason: 'could not reach the coordinator before the lease ran out' };
+      if (!stopped && Date.now() >= leaseUntil) return { stopped: 'lease-lapsed', reason: 'could not reach the coordinator before the lease ran out' };
     }
   }
   return { stopped: 'aborted' };
 }
 
-export async function listTasks({ url, deviceId, token, timeoutMs = 5000 }) {
-  const res = await fetch(`${url.replace(/\/$/, '')}/v1/tasks/mine`, {
+async function get({ url, deviceId, token, path, timeoutMs = 5000 }) {
+  const res = await fetch(`${url.replace(/\/$/, '')}${path}`, {
     signal: AbortSignal.timeout(timeoutMs),
     headers: { 'x-device-id': deviceId, authorization: `Bearer ${token}` },
   });
   const data = await res.json().catch(() => ({}));
   return { status: res.status, ok: res.ok, data };
 }
+
+export const listTasks = (cfg) => get({ ...cfg, path: '/v1/tasks/mine' });
+// Whether the operator's stop is in force. A coordinator older than this helper answers 404.
+export const getStop = (cfg) => get({ ...cfg, path: '/v1/stop' });
 
 // Plain-language reason for a refused claim.
 export function claimRefusal(r) {
@@ -103,6 +118,7 @@ export function claimRefusal(r) {
     case 'assigned': return `reserved for ${d.owner}`;
     case 'returned': return `a failed review returned it to ${d.owner}`;
     case 'closed': return 'the task is closed';
+    case 'stopped': return `${stopLine(d)}. Nothing can be claimed until the operator resumes`;
     case 'unknown_task': return 'no such task';
     default: return d.error ?? `http ${r.status}`;
   }

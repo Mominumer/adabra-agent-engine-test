@@ -13,7 +13,19 @@
       "Bash(gh pr merge:*)",
       "Bash(git push origin main:*)",
       "Bash(git push --force:*)",
-      "Bash(git push -f:*)"
+      "Bash(git push -f:*)",
+      "Bash(*main.js override*)",
+      "Bash(*ops.sh override*)",
+      "Bash(*main.js resume*)",
+      "Bash(*ops.sh resume*)",
+      "Bash(rm *adabra-control*)",
+      "Bash(mv *adabra-control*)",
+      "Bash(*> *adabra-control*)",
+      "Bash(script *)",
+      "Bash(expect *)",
+      "Bash(unbuffer *)",
+      "Edit(~/.adabra-control/**)",
+      "Write(~/.adabra-control/**)"
     ],
     "allow": [
       "Bash(npm test)",
@@ -35,7 +47,13 @@
       "Bash(node coordinator/main.js claims)",
       "Bash(service/coordinator-service.sh status)",
       "Bash(service/helper-service.sh status)",
-      "Bash(service/reviewer-service.sh status)"
+      "Bash(service/reviewer-service.sh status)",
+      "Bash(service/ops.sh stop:*)",
+      "Bash(service/ops.sh status)",
+      "Bash(service/ops.sh check)",
+      "Bash(node ops/main.js stop:*)",
+      "Bash(node ops/main.js status)",
+      "Bash(node ops/main.js check)"
     ]
   }
 }

@@ -9,6 +9,9 @@
 # Settings (override by exporting before `install`):
 #   GITHUB_REPO         default Mominumer/adabra-agent-engine-test
 #   REVIEW_TOKEN_FILE   default ~/.adabra/review-token (the reviewer's own token, not the coordinator's)
+#   REVIEW_APP_ID, REVIEW_APP_INSTALLATION_ID, REVIEW_APP_KEY_FILE
+#                       use a GitHub App instead of the token file (see the README): all three, or none.
+#                       They are checked with GitHub before the running service is touched.
 #   REVIEW_AUTHORS      required: comma-separated GitHub logins whose PRs may run on the mini
 #   REVIEW_DB           default <repo>/reviewer.db
 #   REVIEW_IMAGE        default node:26-slim (pull it first; pin by digest)
@@ -16,6 +19,9 @@
 #   REVIEW_DEVICE_ID    this reviewer's enrolled device, role reviewer. Unset: tasks are not told review results
 #   REVIEW_DEVICE_TOKEN_FILE  default ~/.adabra/reviewer-device-token (that device's token, not a GitHub token)
 #   REVIEW_COORDINATOR_URL    e.g. http://127.0.0.1:8787
+#   REVIEW_ENGINE       default mock. shadow and claude also need: sudo service/review-user.sh install --enable-model
+#   REVIEW_DAILY_CAP    default 30 real review runs per UTC day
+#   REVIEW_UNSHOWN_OK   extensions a changed file may have when GitHub will not show it (default: images and fonts)
 set -euo pipefail
 
 LABEL="ai.adabra.reviewer"
@@ -28,15 +34,30 @@ case "${1:-}" in
   install)
     NODE="$(command -v node)" || { echo "node not found on PATH"; exit 1; }
     GITHUB_REPO="${GITHUB_REPO:-Mominumer/adabra-agent-engine-test}"
-    REVIEW_TOKEN_FILE="${REVIEW_TOKEN_FILE:-$HOME/.adabra/review-token}"
+    REVIEW_APP_ID="${REVIEW_APP_ID:-}"
+    REVIEW_APP_INSTALLATION_ID="${REVIEW_APP_INSTALLATION_ID:-}"
+    REVIEW_APP_KEY_FILE="${REVIEW_APP_KEY_FILE:-}"
     REVIEW_DB="${REVIEW_DB:-$REPO_DIR/reviewer.db}"
     REVIEW_IMAGE="${REVIEW_IMAGE:-node:26-slim}"
     REVIEW_TEST_CMD="${REVIEW_TEST_CMD:-npm test}"
     REVIEW_DEVICE_ID="${REVIEW_DEVICE_ID:-}"
     REVIEW_DEVICE_TOKEN_FILE="${REVIEW_DEVICE_TOKEN_FILE:-$HOME/.adabra/reviewer-device-token}"
     REVIEW_COORDINATOR_URL="${REVIEW_COORDINATOR_URL:-}"
+    REVIEW_ENGINE="${REVIEW_ENGINE:-mock}"
+    REVIEW_DAILY_CAP="${REVIEW_DAILY_CAP:-30}"
+    REVIEW_UNSHOWN_OK="${REVIEW_UNSHOWN_OK:-}"
     [ -n "${REVIEW_AUTHORS:-}" ] || { echo "set REVIEW_AUTHORS, e.g. REVIEW_AUTHORS=alice,bob $0 install"; exit 1; }
-    [ -f "$REVIEW_TOKEN_FILE" ] || { echo "missing review token file: $REVIEW_TOKEN_FILE"; exit 1; }
+    if [ -n "$REVIEW_APP_ID$REVIEW_APP_INSTALLATION_ID$REVIEW_APP_KEY_FILE" ]; then
+      (cd "$REPO_DIR" && GITHUB_REPO="$GITHUB_REPO" REVIEW_APP_ID="$REVIEW_APP_ID" REVIEW_APP_INSTALLATION_ID="$REVIEW_APP_INSTALLATION_ID" \
+        REVIEW_APP_KEY_FILE="$REVIEW_APP_KEY_FILE" "$NODE" reviewer/main.js github-check) || { echo "GitHub App settings did not pass; the running service was not touched"; exit 1; }
+      AUTH_ENV="    <key>REVIEW_APP_ID</key><string>$REVIEW_APP_ID</string>
+    <key>REVIEW_APP_INSTALLATION_ID</key><string>$REVIEW_APP_INSTALLATION_ID</string>
+    <key>REVIEW_APP_KEY_FILE</key><string>$REVIEW_APP_KEY_FILE</string>"
+    else
+      REVIEW_TOKEN_FILE="${REVIEW_TOKEN_FILE:-$HOME/.adabra/review-token}"
+      [ -f "$REVIEW_TOKEN_FILE" ] || { echo "missing review token file: $REVIEW_TOKEN_FILE"; exit 1; }
+      AUTH_ENV="    <key>REVIEW_TOKEN_FILE</key><string>$REVIEW_TOKEN_FILE</string>"
+    fi
     mkdir -p "$(dirname "$PLIST")" "$(dirname "$LOG")"
     cat > "$PLIST" <<PLIST_EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -50,7 +71,7 @@ case "${1:-}" in
   <key>EnvironmentVariables</key>
   <dict>
     <key>GITHUB_REPO</key><string>$GITHUB_REPO</string>
-    <key>REVIEW_TOKEN_FILE</key><string>$REVIEW_TOKEN_FILE</string>
+$AUTH_ENV
     <key>REVIEW_AUTHORS</key><string>$REVIEW_AUTHORS</string>
     <key>REVIEW_DB</key><string>$REVIEW_DB</string>
     <key>REVIEW_IMAGE</key><string>$REVIEW_IMAGE</string>
@@ -58,6 +79,9 @@ case "${1:-}" in
     <key>REVIEW_DEVICE_ID</key><string>$REVIEW_DEVICE_ID</string>
     <key>REVIEW_DEVICE_TOKEN_FILE</key><string>$REVIEW_DEVICE_TOKEN_FILE</string>
     <key>REVIEW_COORDINATOR_URL</key><string>$REVIEW_COORDINATOR_URL</string>
+    <key>REVIEW_ENGINE</key><string>$REVIEW_ENGINE</string>
+    <key>REVIEW_DAILY_CAP</key><string>$REVIEW_DAILY_CAP</string>
+    <key>REVIEW_UNSHOWN_OK</key><string>$REVIEW_UNSHOWN_OK</string>
     <key>PATH</key><string>$HOME/.docker/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
   </dict>
   <key>RunAtLoad</key><true/>

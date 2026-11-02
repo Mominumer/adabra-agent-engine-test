@@ -179,8 +179,9 @@ ends it, as does `node coordinator/main.js task-assign TASK-7 <device-id|none>`.
 ## Review user containment (Mac mini, no model yet)
 
 The real review will read untrusted PR text, so it runs as a separate macOS user that holds no GitHub token and cannot enter the
-dispatcher's home folder. This part builds and proves that boundary. **Nothing here can call Claude**: the wrapper has no model
-step, never loads the credential, and exits 78 if asked to review. `adabra/review` is still the mock.
+dispatcher's home folder. This part builds and proves that boundary. **A plain install cannot call Claude**: the wrapper's model
+step is switched off, it never loads the credential, and it exits 78 if asked to review. `adabra/review` is still the mock unless
+`REVIEW_ENGINE` says otherwise (below).
 
 ```
 dispatcher (holds the review GitHub token)
@@ -200,6 +201,7 @@ what was dropped. A change to a dropped file still shows as text in `diff.patch`
 sudo service/review-user.sh install        # root-owned wrapper and settings, the job root, one sudoers line; safe to re-run
 node reviewer/main.js review-check         # must end with "review user is contained"; needs no sudo, token or database
 sudo service/review-user.sh uninstall      # removes them; keeps the user, its login and the CLI
+sudo service/review-user.sh install --enable-model   # also turns the model step on: reviews can then spend. A plain install turns it off
 ```
 
 The wrapper and its settings are copies owned by root, so a merged PR changes nothing here until the installer runs again.
@@ -341,6 +343,197 @@ What an older reviewer database means, and what to do:
 - **PR comments** are found again by their marker, so there is no second one.
 
 Afterwards, for either one: run `service/backup-service.sh run`, so the next restore starts from here. Delete the `before-restore-*` folder by hand once you are sure. It holds the same sensitive data as a backup, and retention never touches it.
+`review-check` cannot spend, with the model step on or off. To start the model the wrapper needs both the root-owned
+`etc/model-enabled` (absent: exit 78) and a `paid-run` mark in the job directory (absent: exit 79). Only the dispatcher's paid path
+writes that mark; the jobs `review-check` builds never hold it, and a PR's files all go under `tree/`, where the mark does not count.
+
+## The real review's output handling
+
+```
+REVIEW_ENGINE=mock     (default) the mock decides. No job directory, no sudo, nothing paid
+REVIEW_ENGINE=shadow   the mock decides; the real review also runs and posts only a verdict to adabra/review-shadow, not required.
+                       Its findings stay in the local log
+REVIEW_ENGINE=claude   the real review decides adabra/review
+REVIEW_DAILY_CAP=30    real review runs per UTC day, counted before each one starts, retries included
+```
+
+Before anything is spent: if the tests did not pass, `adabra/review` is `error` ("Skipped: tests failed"). Checks that need no model
+can only block: an added debugger statement, hidden Unicode, a changed file GitHub will not show (unless it is an image or font, or
+`REVIEW_UNSHOWN_OK` lists its extension), a diff of 100 files or 256 KB. The PR's head is compared with the commit just before the
+run. A valid result is stored by PR, commit, skill and model, so a retry after GitHub failed, or a restart, does not pay again.
+
+What comes back is untrusted, so the dispatcher checks it itself: the result's type, subtype and `is_error` together, its own check
+against `reviewer/review-user/review-schema.json`, the commit, the verdict against the findings, every file against the job, and an
+empty list of denied tool calls. Anything else is `error`; nothing but a fully valid `pass` is `success`. Status text is fixed
+strings or counts, so the model's words never reach a status, and the CLI's own text goes only to the local log. Findings go in the
+PR comment inside a code block, where no link, image or HTML can take effect, followed by a list of paths to read yourself. The
+review is advisory: a pass means the reviewer raised no blocker, not that the change is safe.
+
+| Failure | `adabra/review` | What happens next |
+|---|---|---|
+| Account limit, or 402/429 | `error`: paused | All real reviews wait until the stated reset, or 1 h doubling to 6 h. One job probes when it ends. Uses no attempts |
+| Not logged in, bad credential, 401/403, model step off | `error`: operator action needed | All real reviews wait for `retry <pr>` or a restart. Uses no attempts |
+| Daily cap | `error`: daily limit | Until 00:00 UTC. Uses no attempts |
+| 5xx, network | `error` | Backs off, at most 3 attempts on a commit, then final |
+| Turn, budget or time limit; invalid output | `error`, final | No automatic retry. `retry <pr>` runs it again |
+| Anything unrecognised | `error` | Retried like the row above, and three in a row open the same pause as an account limit |
+
+While reviews are paused the tests still run and `adabra/tests` still posts its real result. A pause is kept in `reviewer.db` across
+restarts, except the one waiting for the operator, which a restart lifts. `node reviewer/main.js status` shows the pause and the
+day's count.
+
+**With an emergency stop.** The dispatcher looks at the stop at the last moment before each paid run, so none starts during a stop. A
+run that has already started cannot be ended from here, as it belongs to another user. It finishes, a valid result is stored and it
+counts towards the daily cap, nothing about it is posted, and the job goes back to the queue. After `resume` the job uses the stored
+result and pays nothing. A result that was not valid is not stored, so that one job pays again.
+
+**With a GitHub App outage.** An `authOutage` from the diff, the tarball, the head check or posting holds the job and retries every 30
+seconds. No run is started or counted because of it. A result already paid for is stored, so it is posted once GitHub answers again.
+
+A stop, a pause and an outage hold don't use attempts, and none of them changes another's state: a job waits for whichever applies.
+
+**`override` works whatever `REVIEW_ENGINE` is,** since that command never builds a review engine. It also works on a job that is
+waiting out a pause, because an outage blocking a merge is what it is for. It takes that job out of the queue so its result cannot replace
+the override, and `retry <pr>` brings it back. It still refuses a job that is running or about to run.
+
+## Emergency stop and operator override (Mac mini)
+
+```bash
+service/ops.sh stop --reason "..."           # stop everything, until resume. Works with any service down.
+service/ops.sh resume                        # undo it; asks you to type the word
+service/ops.sh status                        # what is in force, and why
+service/ops.sh override <pr> --reason "..."  # adabra/review passes on the PR's current head commit; asks you to type the words
+```
+
+**While stopped:**
+
+| Part | What it does |
+|---|---|
+| Coordinator | Refuses claims, renewals, checkpoints and review results with `503 stopped` and the reason. Writes nothing to GitHub. Tasks are still listed, a claim can still be released, and the read-only task sync goes on. |
+| Held leases | Kept alive by the coordinator itself, so a stop of any length costs nobody a claim and no other device can take the task on resume. Same owner, same generation. A lease that had lapsed before the stop stays lapsed. |
+| Helpers | Tell their owner once, as for a lost claim, and keep their claims. `tasks` and `status` show the stop and its reason. Checkpoints wait in the outbox with no backoff and go in the first pass after resume. |
+| Reviewer | Starts nothing and posts nothing, and does not poll. A queued review stays queued and shows `pending`. A running job's container is ended within seconds, nothing about that run is posted, and it goes back to the queue without using up an attempt. Once posting has begun it finishes, so a result is never half-posted. |
+| Overnight runner | Must run `service/ops.sh check` before it starts anything and between steps: exit 0 = go; any other exit = do not start. It prints one line of JSON. From Node: `isStopped()` in `shared/stop.js`. |
+
+**Where it lives.** `~/.adabra-control/stop.json` (or `ADABRA_STOP_FILE`, if you set it for the services too). It belongs to no service, so `stop` works with any of them down, and each one reads it for itself. It is on disk, so a stop survives restarts and reboots. The file and its folder are readable by other users, so never put a secret in a reason. Only a missing file and a well-formed "not stopped" mean running; anything else that cannot be read counts as stopped. `resume` repairs a damaged file. `/healthz` also says `"stopped": true`.
+
+Run `resume` with the coordinator up: a lease that ran out while the coordinator was down is restored only if the coordinator comes back before the resume. `resume` warns you.
+
+**What a stop does not do.** It does not end a builder session already running on someone's machine: the owner is told, and that session can no longer claim or report progress, but it runs until someone ends it. It does not block `git push` or anything else that goes straight to GitHub.
+
+**Reasons are plain text.** One line, no controls, no working `@mentions`, no Markdown or HTML. An override's reason goes to the reviewer's log and never to GitHub; the status always reads `operator override`. A stop's reason goes to enrolled devices and never to GitHub.
+
+**Override** acts on the head commit it showed you, looked up again after you confirm. It refuses a closed or merged PR, and refuses while a review of that commit is queued or running, because the result would replace it (a real review waiting out a pause is the exception: see above). It never touches `adabra/tests`, so a PR whose tests failed stays blocked. A new push loses it, because statuses belong to a commit. It leaves a record in `~/Library/Logs/adabra-reviewer.log` (or `REVIEW_LOG_FILE`) before it posts: if it cannot write there, it does not post. It works during a stop, because it is a person's deliberate act and no job is involved.
+
+**Who may run what.** Agents may run `stop`, `status` and `check`: stopping is the safe direction. `resume` and `override` are for a person at the mini, like merging. Both need a terminal and a typed confirmation, and `.claude/settings.json` denies them. **That is a speed bump, not a boundary.** While builder sessions run as the same macOS user as the reviewer, an agent can fake a terminal, edit the state file or read the token or key. Deny rules only bind sessions that load this repo's settings. A hard boundary needs the planned separate builder user.
+## GitHub App instead of personal tokens (Mac mini)
+
+By default each service uses its token file. Set a service's three app settings and it uses short-lived installation tokens
+instead: a JWT signed with the app's private key buys a token good for an hour, which is cached and renewed five minutes before
+it expires. Set none and nothing changes. Set some, or set them wrong, and the service refuses to start. It never falls back to a
+token file. Each service reads only its own settings and has its own key:
+
+| Service | Settings | What its token is limited to |
+|---|---|---|
+| coordinator | `GITHUB_APP_ID`, `GITHUB_APP_INSTALLATION_ID`, `GITHUB_APP_KEY_FILE` | Issues: write |
+| reviewer | `REVIEW_APP_ID`, `REVIEW_APP_INSTALLATION_ID`, `REVIEW_APP_KEY_FILE` | Contents: read, Pull requests: write, Commit statuses: write, Issues: write |
+
+Each token also covers only `GITHUB_REPO`. This limits what a leaked token can do. It is not a wall between the services: both run
+as the same user, and whoever holds a key can ask for all of the app's permissions.
+
+The key file must be an absolute path to a regular file outside this repository, owned by the service's user, with mode 600 or 400.
+Git ignores `*.pem` and `*.key`. The review user cannot enter the service user's home folder (`review-check` proves it, as
+`read.home`), so `~/.adabra` keeps the keys from the review step too.
+
+### Setting it up
+
+Do this in a browser on the mini, so the key never has to travel.
+
+1. **Create the app.** On the account that owns the repository: profile picture > Settings > Developer settings > GitHub Apps >
+   New GitHub App.
+   - GitHub App name: your choice, under 35 characters. Comments will come from `<name>[bot]`.
+   - Homepage URL: this repository's URL.
+   - Webhook: untick **Active**. Nothing here uses webhooks.
+   - Repository permissions: **Contents** Read-only, **Pull requests** Read and write, **Commit statuses** Read and write,
+     **Issues** Read and write. **Metadata** stays Read-only, which GitHub requires. Leave everything else at No access.
+   - Where can this GitHub App be installed: **Only on this account**.
+   - Create GitHub App.
+2. **Note the App ID**, shown at the top of the app's General page.
+3. **Make two keys, one per service**, so either can be revoked alone. In the app's settings: Credentials > Key pairs > New key (on
+   a page that says Private keys instead: Generate a private key). Each one downloads a `.pem` once, and GitHub keeps only the
+   public half. Move them straight out of Downloads:
+   ```bash
+   umask 077; mkdir -p ~/.adabra; chmod 700 ~/.adabra
+   mv ~/Downloads/<first-key>.pem ~/.adabra/coordinator-app-key.pem
+   mv ~/Downloads/<second-key>.pem ~/.adabra/review-app-key.pem
+   chmod 600 ~/.adabra/coordinator-app-key.pem ~/.adabra/review-app-key.pem
+   ```
+4. **Install it on this one repository.** In the app's settings: Install App > Install on your account > Only select repositories >
+   this repository > Install.
+5. **Note the installation ID**: the number at the end of the page's address, `https://github.com/settings/installations/<id>`.
+   (You can get back there with Settings > Applications > Installed GitHub Apps > Configure.)
+6. **Ask GitHub whether it all works**, with the code that has this feature. This only reads, and changes nothing that is running:
+   ```bash
+   GITHUB_REPO=Mominumer/adabra-agent-engine-test GITHUB_APP_ID=<app-id> GITHUB_APP_INSTALLATION_ID=<installation-id> \
+     GITHUB_APP_KEY_FILE=$HOME/.adabra/coordinator-app-key.pem node coordinator/main.js github-check
+   GITHUB_REPO=Mominumer/adabra-agent-engine-test REVIEW_APP_ID=<app-id> REVIEW_APP_INSTALLATION_ID=<installation-id> \
+     REVIEW_APP_KEY_FILE=$HOME/.adabra/review-app-key.pem node reviewer/main.js github-check
+   ```
+   Each must end with `github-check passed`. Check two things it prints. The permissions must be the ones in the table above, plus
+   `metadata=read`. The coordinator's count of labelled issues must match what `node coordinator/main.js tasks` lists from GitHub:
+   task sync closes a task whose issue it cannot see, so an unexpectedly short list must stop you here.
+7. **Switch the coordinator.** `install` runs the same check first, and if it fails, leaves the running service alone:
+   ```bash
+   GITHUB_APP_ID=<app-id> GITHUB_APP_INSTALLATION_ID=<installation-id> GITHUB_APP_KEY_FILE=$HOME/.adabra/coordinator-app-key.pem \
+     service/coordinator-service.sh install
+   ```
+   The log (`service/coordinator-service.sh logs`) must say `GitHub auth: GitHub App ...`. Write a checkpoint on a task and see its
+   progress comment change.
+8. **Switch the reviewer.** `install` keeps only what it is given, so pass everything you installed it with last time, not only the
+   new settings:
+   ```bash
+   REVIEW_APP_ID=<app-id> REVIEW_APP_INSTALLATION_ID=<installation-id> REVIEW_APP_KEY_FILE=$HOME/.adabra/review-app-key.pem \
+     REVIEW_AUTHORS=... REVIEW_IMAGE=... REVIEW_DEVICE_ID=... REVIEW_COORDINATOR_URL=... \
+     service/reviewer-service.sh install
+   ```
+   Push to an open PR: both checks must appear, from the app, and the PR's review comment must change.
+9. **Retire the personal tokens** once this has run well for a few days. Revoke them at Settings > Developer settings > Personal
+   access tokens > Fine-grained tokens, then `rm ~/.adabra/github-token ~/.adabra/review-token`. Keep them until then: they are how
+   you switch back.
+
+**To switch back,** run the same `install` commands without the app settings. With none set, the service uses its token file again.
+If you have already revoked the token, make a new one first. To remove the app altogether, delete its keys and uninstall it at
+Settings > Applications > Installed GitHub Apps.
+
+### What looks different afterwards
+
+- **Comments and commit statuses come from `<name>[bot]`,** not from a person. The services never commit, push or open a PR, so the
+  app has no commits. Commits stay under whoever made them.
+- **Comments written before the switch are still found.** Lookup goes by the hidden marker and never by author. GitHub says anyone
+  with write access to a repository can edit others' comments, so the app is expected to edit them in place: the author shown stays
+  the old one, and the edit history shows the app. GitHub's documents do not say this in so many words for an app, so the code also
+  handles a refusal: it leaves the old comment as it stands, posts one new comment and carries on with that one, and the log says
+  `GitHub refused an edit`. Either way there is no retry loop and no event is lost. The same goes for switching back.
+- **`REVIEW_AUTHORS` is unaffected.** It lists who wrote a PR, and the app writes no PRs.
+- **`service/ops.sh override` posts as the reviewer does,** so it needs nothing new from you in an emergency. It takes the three app
+  settings from the reviewer's installed plist, unless you exported any of them yourself, and so it follows a switch in either
+  direction. The status comes from `<name>[bot]` and still reads `operator override`. Run `node reviewer/main.js override` directly
+  and only your shell's settings count, which without them means the token file.
+- **Required checks are unaffected** as long as they accept any source, which `main`'s do today. If someone pins a required check
+  to a particular app in branch protection, it must be this one.
+
+### If GitHub will not issue a token
+
+The service stays up and nothing is lost. Whether GitHub is down, the key was revoked, the app was uninstalled or a permission was
+removed, the coordinator's events and the reviewer's jobs wait and retry every 30 seconds without using up an attempt, so they
+cannot go `dead` or `failed` this way, and they carry on by themselves once the problem is fixed. The log says `not counted as an
+attempt` and gives the reason. A wrong app ID or installation ID shows up this way as well, because a refusal from GitHub cannot
+be told apart from one on a bad day: that is what step 6 is for.
+
+An emergency stop comes first. While one is in force the worker and the reviewer attempt nothing and count nothing, and work held for
+an outage stays held. After `resume`, a problem that remains holds the work in the same way, and a token that expired during the stop
+is replaced on first use. A stop does not end the read-only task sync, which still asks GitHub for a token when it needs one: that
+writes nothing to the repository. `override` cannot post without a token: it says so, and posts nothing.
 
 ## Not built yet (by design)
 
