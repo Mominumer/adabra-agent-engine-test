@@ -61,6 +61,26 @@ export class ReviewGitHub {
     return out;
   }
 
+  // One PR as it is right now, or null when there is no such PR.
+  async getPull(number) {
+    let p;
+    try {
+      p = await this.#req('GET', `/repos/${this.repo}/pulls/${number}`);
+    } catch (err) {
+      if (err.status === 404) return null;
+      throw err;
+    }
+    return {
+      number: p.number,
+      sha: p.head.sha,
+      branch: p.head.ref,
+      state: p.state,
+      merged: Boolean(p.merged),
+      author: p.user?.login ?? null,
+      title: p.title,
+    };
+  }
+
   // state: pending | success | failure | error. GitHub limits description to 140 characters.
   async setStatus(sha, context, state, description) {
     await this.#req('POST', `/repos/${this.repo}/statuses/${sha}`, {

@@ -15,6 +15,7 @@ import { syncTasks } from '../coordinator/sync.js';
 import { Worker } from '../coordinator/worker.js';
 import { Dispatcher } from '../reviewer/dispatcher.js';
 import { REVIEW_MARKER, REVIEW_PERMISSIONS, ReviewGitHub } from '../reviewer/github.js';
+import { OVERRIDE_TEXT, overrideCommand, runOverride } from '../reviewer/override.js';
 import { MAX_ATTEMPTS as JOB_ATTEMPTS, ReviewStore } from '../reviewer/store.js';
 
 const REPO = join(dirname(fileURLToPath(import.meta.url)), '..');
@@ -49,6 +50,7 @@ const NEEDS = [
   ['POST', /^\/repos\/o\/r\/issues\/\d+\/comments/, ['issues', 'pull_requests'], 'write'],
   ['PATCH', /^\/repos\/o\/r\/issues\/comments\/\d+$/, ['issues', 'pull_requests'], 'write'],
   ['GET', /^\/repos\/o\/r\/pulls\?/, ['pull_requests'], 'read'],
+  ['GET', /^\/repos\/o\/r\/pulls\/\d+$/, ['pull_requests', 'contents'], 'read'],
   ['POST', /^\/repos\/o\/r\/statuses\//, ['statuses'], 'write'],
   ['GET', /^\/repos\/o\/r\/tarball\//, ['contents'], 'read'],
   ['GET', /^\/repos\/o\/r\/compare\//, ['contents'], 'read'],
@@ -119,6 +121,10 @@ function fakeGitHub(clock) {
       let m;
       if (req.method === 'GET' && req.url.startsWith('/repos/o/r/issues?')) return json(200, s.issues);
       if (req.method === 'GET' && req.url.startsWith('/repos/o/r/pulls?')) return json(200, s.pulls);
+      if ((m = req.url.match(/^\/repos\/o\/r\/pulls\/(\d+)$/)) && req.method === 'GET') {
+        const p = s.pulls.find((x) => x.number === +m[1]);
+        return p ? json(200, { state: 'open', merged: false, ...p }) : json(404, { message: 'Not Found' });
+      }
       if ((m = req.url.match(/^\/repos\/o\/r\/statuses\/([0-9a-f]+)$/)) && req.method === 'POST') {
         s.statuses.push({ sha: m[1], ...JSON.parse(raw) });
         return json(201, {});
@@ -201,7 +207,7 @@ const checkpoint = (over = {}) => ({
   ...over,
 });
 
-async function coordinator(t, { token = null } = {}) {
+async function coordinator(t, { token = null, stopState } = {}) {
   const h = await harness(t);
   const store = new Store(join(tempDir(t), 'coord.db'));
   t.after(() => store.close());
@@ -210,7 +216,7 @@ async function coordinator(t, { token = null } = {}) {
   const github = token
     ? new GitHubClient({ apiUrl: h.apiUrl, repo: 'o/r', token, timeoutMs: 2000 })
     : new GitHubClient({ apiUrl: h.apiUrl, repo: 'o/r', auth: h.tokens(COORDINATOR_PERMISSIONS), timeoutMs: 2000 });
-  const worker = new Worker({ store, github, log: (m) => logs.push(m) });
+  const worker = new Worker({ store, github, log: (m) => logs.push(m), stopState });
   const row = (id) => store.db.prepare('SELECT status, attempts, last_error FROM events WHERE event_id = ?').get(id);
   const add = (over) => {
     const e = checkpoint(over);
@@ -225,7 +231,7 @@ async function coordinator(t, { token = null } = {}) {
   return { ...h, store, logs, github, worker, row, add, round };
 }
 
-async function reviewer(t, { runTests = async () => ({ state: 'success', summary: 'ok' }), token = null } = {}) {
+async function reviewer(t, { runTests = async () => ({ state: 'success', summary: 'ok' }), token = null, isStopped } = {}) {
   const h = await harness(t);
   const store = new ReviewStore(join(tempDir(t), 'reviewer.db'));
   t.after(() => store.close());
@@ -235,7 +241,7 @@ async function reviewer(t, { runTests = async () => ({ state: 'success', summary
     : new ReviewGitHub({ apiUrl: h.apiUrl, repo: 'o/r', auth: h.tokens(REVIEW_PERMISSIONS), timeoutMs: 2000 });
   const d = new Dispatcher({
     store, github, repo: 'o/r', authors: ['alice'], now: () => h.clock.t, log: (m) => logs.push(m),
-    runTests: (job) => runTests(job, github), runReview: async () => ({ state: 'success', summary: 'no findings' }),
+    runTests: (job) => runTests(job, github), runReview: async () => ({ state: 'success', summary: 'no findings' }), isStopped,
   });
   const pull = (number, s) => ({ number, title: `PR ${number}`, body: '', draft: false, user: { login: 'alice' }, head: { sha: s, ref: `task/TASK-${number}`, repo: { full_name: 'o/r' } } });
   return { ...h, store, logs, github, d, pull };
@@ -1028,7 +1034,7 @@ case "$1" in
   bootstrap) touch "${log}.loaded" ;;
   bootout) rm -f "${log}.loaded" ;;
 esac`);
-  script('node', `echo "node $* key=$GITHUB_APP_KEY_FILE$REVIEW_APP_KEY_FILE" >> "${log}"
+  script('node', `echo "node $* app=$REVIEW_APP_ID,$REVIEW_APP_INSTALLATION_ID key=$GITHUB_APP_KEY_FILE$REVIEW_APP_KEY_FILE" >> "${log}"
 exit "\${FAKE_NODE_EXIT:-0}"`);
   script('lsof', 'exit 1');
   script('curl', 'echo ok');
@@ -1036,7 +1042,7 @@ exit "\${FAKE_NODE_EXIT:-0}"`);
   const home = join(dir, 'home');
   mkdirSync(home);
   return {
-    home, log,
+    home, log, path: `${bin}:/usr/bin:/bin`,
     calls: () => (existsSync(log) ? readFileSync(log, 'utf8') : ''),
     run: (service, env) => spawnSync(join(REPO, 'service', `${service}-service.sh`), ['install'], {
       encoding: 'utf8', timeout: 30_000, env: { PATH: `${bin}:/usr/bin:/bin`, HOME: home, ...env },
@@ -1090,5 +1096,335 @@ for (const { service, prefix, tokenEnv, extra } of SCRIPTS) {
     assert.match(r.stdout, /did not pass; the running service was not touched/);
     assert.ok(!existsSync(f.plist(service)));
     assert.doesNotMatch(f.calls(), /launchctl/);
+  });
+}
+
+// --- where the app meets the emergency stop ---------------------------------------------------------
+
+const STOPPED = Object.freeze({ stopped: true, reason: 'drill', since: null });
+const NOT_STOPPED = Object.freeze({ stopped: false });
+
+test('coordinator, stopped during an outage: no token is asked for and nothing is touched; after resume the event is held, then applied once', async (t) => {
+  let stop = STOPPED;
+  const c = await coordinator(t, { stopState: () => stop });
+  const e = c.add();
+  c.gh.s.mintStatus = 503;
+  for (let i = 0; i < EVENT_ATTEMPTS * 2; i++) await c.round();
+  assert.deepEqual({ ...c.row(e.event_id) }, { status: 'pending', attempts: 0, last_error: null });
+  assert.equal(c.gh.mintRequests(), 0, 'a stopped worker does not even ask');
+
+  stop = NOT_STOPPED;
+  for (let i = 0; i < EVENT_ATTEMPTS * 2; i++) await c.round();
+  assert.deepEqual({ status: c.row(e.event_id).status, attempts: c.row(e.event_id).attempts }, { status: 'pending', attempts: 0 });
+  assert.ok(c.gh.mintRequests() > 0);
+  assert.ok(c.row(e.event_id).last_error, 'held now, with the reason on record');
+
+  c.gh.s.mintStatus = null;
+  await c.round();
+  assert.equal(c.row(e.event_id).status, 'done');
+  assert.equal(c.gh.s.comments.length, 1);
+});
+
+test('coordinator: an event held for an outage waits through a stop, and is applied only after resume', async (t) => {
+  let stop = NOT_STOPPED;
+  const c = await coordinator(t, { stopState: () => stop });
+  const e = c.add();
+  c.gh.s.mintStatus = 401;
+  await c.round();
+  assert.ok(c.row(e.event_id).last_error);
+  stop = STOPPED;
+  c.gh.s.mintStatus = null;
+  for (let i = 0; i < EVENT_ATTEMPTS * 2; i++) await c.round();
+  assert.deepEqual({ status: c.row(e.event_id).status, attempts: c.row(e.event_id).attempts }, { status: 'pending', attempts: 0 });
+  assert.equal(c.gh.s.comments.length, 0, 'the fix alone does not lift the stop');
+  stop = NOT_STOPPED;
+  await c.round();
+  assert.equal(c.row(e.event_id).status, 'done');
+  assert.equal(c.gh.s.comments.length, 1);
+});
+
+test('coordinator: a stop arriving part-way through a pass does not turn an outage into used attempts', async (t) => {
+  let stop = NOT_STOPPED;
+  const c = await coordinator(t, { stopState: () => stop });
+  c.store.addTask('TASK-2', 2);
+  const a = c.add();
+  const b = c.add({ task_id: 'TASK-2' });
+  const hold = c.store.holdEvent.bind(c.store);
+  c.store.holdEvent = (...args) => ((stop = STOPPED), hold(...args));
+  c.gh.s.mintStatus = 503;
+  await c.round();
+  for (const e of [a, b]) {
+    assert.deepEqual({ status: c.row(e.event_id).status, attempts: c.row(e.event_id).attempts }, { status: 'pending', attempts: 0 });
+    assert.ok(c.row(e.event_id).last_error, 'each one held for the outage');
+  }
+  assert.equal(c.store.counts().dead, undefined);
+});
+
+test('coordinator: a stop that outlives the token: nothing is minted meanwhile, and the first write after resume gets a new one', async (t) => {
+  let stop = NOT_STOPPED;
+  const c = await coordinator(t, { stopState: () => stop });
+  c.add({ summary: 'before the stop' });
+  await c.round();
+  assert.equal(c.gh.s.mints.length, 1);
+  stop = STOPPED;
+  const e = c.add({ summary: 'after the stop' });
+  c.clock.t += 3 * HOUR;
+  await c.round();
+  assert.equal(c.gh.s.mints.length, 1);
+  stop = NOT_STOPPED;
+  await c.round();
+  assert.equal(c.gh.s.mints.length, 2);
+  assert.equal(c.row(e.event_id).status, 'done');
+  assert.equal(c.gh.s.comments.length, 1);
+  assert.match(c.gh.s.comments[0].body, /after the stop/);
+});
+
+test('reviewer: a stop during a run that also meets an outage goes back as stopped, once, with no attempt used and no wait', async (t) => {
+  let stopped = false;
+  const r = await reviewer(t, {
+    isStopped: () => stopped,
+    runTests: async (job, github) => {
+      stopped = true;
+      assert.equal(r.d.interrupt(), true);
+      await github.downloadTarball(job.sha);
+      return { state: 'success', summary: 'ok' };
+    },
+  });
+  r.gh.s.pulls.push(r.pull(5, sha(1)));
+  await r.d.poll();
+  r.gh.revokeAll();
+  r.gh.s.mintStatus = 503;
+  r.clock.t += 5 * MIN;
+  assert.deepEqual(await r.d.runOnce(), { pr: 5, sha: sha(1), parked: true });
+  const job = r.store.getJob(5, sha(1));
+  assert.deepEqual({ state: job.state, attempts: job.attempts }, { state: 'queued', attempts: 0 });
+  assert.ok(r.logs.some((l) => l.includes('stopped by the operator')));
+  assert.ok(!r.logs.some((l) => l.includes('not counted as an attempt')), 'parked or held, never both');
+  assert.equal(r.gh.s.statuses.filter((s) => s.state !== 'pending').length, 0);
+  stopped = false;
+  assert.equal(r.store.next(r.clock.t).pr, 5, 'due again at once');
+});
+
+test('reviewer: a job held for an outage waits through a stop, then keeps its wait, then finishes once', async (t) => {
+  let stopped = false;
+  const r = await reviewer(t, { isStopped: () => stopped });
+  r.gh.s.pulls.push(r.pull(5, sha(1)));
+  await r.d.poll();
+  r.gh.revokeAll();
+  r.gh.s.mintStatus = 503;
+  r.clock.t += 5 * MIN;
+  await r.d.runOnce();
+  assert.equal(r.store.getJob(5, sha(1)).state, 'queued');
+
+  stopped = true;
+  r.gh.s.mintStatus = null;
+  const before = r.gh.s.requests.length;
+  assert.equal(await r.d.poll(), 0);
+  assert.equal(await r.d.runOnce(), null);
+  assert.equal(r.gh.s.requests.length, before, 'stopped: GitHub hears nothing');
+
+  stopped = false;
+  assert.equal(await r.d.runOnce(), null, 'the hold still applies right after resume');
+  r.clock.t += 5 * MIN;
+  assert.deepEqual(await r.d.runOnce(), { pr: 5, sha: sha(1), tests: 'success', review: 'success' });
+  assert.equal(r.store.getJob(5, sha(1)).attempts, 1);
+});
+
+test('reviewer: holds and stops take back only their own attempt, so real failures still count and the job is not lost', async (t) => {
+  let mode = 'docker';
+  let stopped = false;
+  const r = await reviewer(t, {
+    isStopped: () => stopped,
+    runTests: async (job, github) => {
+      if (mode === 'docker') throw new Error('docker is not available');
+      if (mode === 'stop') {
+        stopped = true;
+        r.d.interrupt();
+      }
+      if (mode === 'outage') await github.downloadTarball(job.sha);
+      return { state: 'success', summary: 'ok' };
+    },
+  });
+  r.gh.s.pulls.push(r.pull(5, sha(1)));
+  await r.d.poll();
+  const run = async () => {
+    r.clock.t += 20 * MIN;
+    return r.d.runOnce();
+  };
+  await run();
+  await run();
+  assert.equal(r.store.getJob(5, sha(1)).attempts, 2, 'two real failures counted');
+
+  for (let i = 0; i < JOB_ATTEMPTS * 2; i++) {
+    mode = 'outage';
+    r.gh.revokeAll();
+    r.gh.s.mintStatus = 503;
+    assert.equal((await run()).retry, true);
+    assert.equal(r.store.getJob(5, sha(1)).attempts, 2, 'a hold changes nothing');
+    mode = 'stop';
+    r.gh.s.mintStatus = null;
+    assert.equal((await run()).parked, true);
+    assert.equal(r.store.getJob(5, sha(1)).attempts, 2, 'nor does a stop');
+    stopped = false;
+  }
+  assert.equal(r.store.getJob(5, sha(1)).state, 'queued');
+
+  mode = 'ok';
+  assert.deepEqual(await run(), { pr: 5, sha: sha(1), tests: 'success', review: 'success' });
+  assert.equal(r.store.getJob(5, sha(1)).state, 'done');
+});
+
+test('reviewer: an outage once posting has begun is held; the stop that arrived meanwhile does not lose it', async (t) => {
+  let stopped = false;
+  const r = await reviewer(t, { isStopped: () => stopped });
+  r.gh.s.pulls.push(r.pull(5, sha(1)));
+  await r.d.poll();
+  const post = r.github.setStatus.bind(r.github);
+  r.github.setStatus = (...args) => {
+    stopped = true; // past the point where a stop can keep the result off GitHub
+    r.gh.revokeAll();
+    r.gh.s.mintStatus = 503;
+    return post(...args);
+  };
+  r.clock.t += 5 * MIN;
+  assert.equal((await r.d.runOnce()).retry, true);
+  const job = r.store.getJob(5, sha(1));
+  assert.deepEqual({ state: job.state, attempts: job.attempts }, { state: 'queued', attempts: 0 });
+  assert.equal(await r.d.runOnce(), null, 'and nothing starts while stopped');
+
+  r.github.setStatus = post;
+  r.gh.s.mintStatus = null;
+  stopped = false;
+  r.clock.t += 5 * MIN;
+  assert.deepEqual(await r.d.runOnce(), { pr: 5, sha: sha(1), tests: 'success', review: 'success' });
+});
+
+// --- the operator's override with an app token ----------------------------------------------------
+
+async function override(t, over = {}) {
+  const r = await reviewer(t);
+  r.gh.s.pulls.push(r.pull(5, sha(1)));
+  const said = [];
+  const logFile = join(tempDir(t), 'review.log');
+  const go = (extra = {}) => runOverride({
+    pr: 5, reason: 'wrong finding', github: r.github, store: r.store, confirm: async () => true, say: (m) => said.push(m), logFile, by: 'operator', ...over, ...extra,
+  });
+  const written = () => (existsSync(logFile) ? readFileSync(logFile, 'utf8') : '');
+  return { ...r, said, logFile, go, written };
+}
+
+const finals = (gh) => gh.s.statuses.filter((s) => s.state !== 'pending');
+
+test('override with an app token: reads the PR, sets only adabra/review on that commit, and leaves no secret anywhere', async (t) => {
+  const o = await override(t);
+  assert.equal(await o.go(), 0);
+  assert.deepEqual(finals(o.gh), [{ sha: sha(1), context: 'adabra/review', state: 'success', description: OVERRIDE_TEXT }]);
+  const asked = o.gh.apiRequests();
+  assert.ok(asked.every((x) => x.token === 'ghs_fake1'), 'every call used the app token');
+  assert.ok(asked.some((x) => x.url === '/repos/o/r/pulls/5'));
+  assert.ok(!`${o.said.join('\n')}${o.written()}`.includes('ghs_fake'));
+  assert.match(o.written(), /posted sha=/);
+});
+
+test('override with an app token: a token refused while the operator was typing is renewed, and the status is still posted', async (t) => {
+  const o = await override(t, {});
+  const code = await o.go({ confirm: async () => (o.gh.revokeAll(), true) });
+  assert.equal(code, 0);
+  assert.equal(o.gh.s.mints.length, 2);
+  assert.equal(finals(o.gh).length, 1);
+});
+
+test('override: GitHub will not issue a token: fails plainly and posts nothing, and an uninstalled app never reads as "no such PR"', async (t) => {
+  const o = await override(t);
+  o.gh.s.mintStatus = 404;
+  o.gh.s.echoSecrets = true;
+  const code = await overrideCommand({
+    args: ['5', '--reason', 'wrong finding'], store: o.store, github: () => o.github, terminal: true, confirm: async () => true, say: (m) => o.said.push(m), logFile: o.logFile,
+  });
+  assert.equal(code, 1);
+  const text = o.said.join('\n');
+  assert.match(text, /Failed, nothing posted: .*installation ID/);
+  assert.doesNotMatch(text, /there is no pull request/);
+  assert.equal(finals(o.gh).length, 0);
+  assert.equal(o.written(), '', 'nothing happened, so nothing is on record');
+  for (const secret of o.gh.s.jwts) assert.ok(!text.includes(secret));
+});
+
+test('override: the token goes between confirming and posting: reports it, records it, posts nothing, and leaks nothing', async (t) => {
+  const o = await override(t);
+  const post = o.github.setStatus.bind(o.github);
+  o.github.setStatus = (...args) => {
+    o.gh.revokeAll();
+    o.gh.s.mintStatus = 500;
+    o.gh.s.echoSecrets = true;
+    o.clock.t += 2 * HOUR;
+    return post(...args);
+  };
+  assert.equal(await o.go(), 1);
+  assert.equal(finals(o.gh).length, 0);
+  assert.match(o.said.join('\n'), /Could not post the status/);
+  assert.match(o.written(), /requested sha=.*\n.*FAILED sha=/);
+  const text = `${o.said.join('\n')}${o.written()}`;
+  for (const secret of [...o.gh.s.jwts, ...o.gh.s.mints.map((m) => m.value)]) assert.ok(!text.includes(secret));
+});
+
+test('override: a PR that really is missing is still told apart, with an app token', async (t) => {
+  const o = await override(t);
+  assert.equal(await o.go({ pr: 6 }), 1);
+  assert.match(o.said.join('\n'), /there is no pull request #6/);
+  assert.equal(finals(o.gh).length, 0);
+});
+
+test('override: incomplete app settings are refused, posting nothing and never reaching for a token file', posixOnly, async (t) => {
+  const said = [];
+  const code = await overrideCommand({
+    args: ['5', '--reason', 'x'], store: null, terminal: true, confirm: async () => true, say: (m) => said.push(m),
+    github: () => new ReviewGitHub({ repo: 'o/r', auth: appAuthFromEnv({ prefix: 'REVIEW', repo: 'o/r', permissions: REVIEW_PERMISSIONS, env: { REVIEW_APP_ID: '1' } }) }),
+  });
+  assert.equal(code, 1);
+  assert.match(said.join('\n'), /Failed, nothing posted: .*REVIEW_APP_INSTALLATION_ID, REVIEW_APP_KEY_FILE not set/);
+});
+
+test('the reviewer\'s token can look up one PR for an override, and the coordinator\'s cannot', async (t) => {
+  const { gh, apiUrl, tokens } = await harness(t);
+  gh.s.pulls.push({ number: 5, title: 'x', user: { login: 'alice' }, head: { sha: sha(1), ref: 'b' } });
+  const pull = await new ReviewGitHub({ apiUrl, repo: 'o/r', auth: tokens(REVIEW_PERMISSIONS), timeoutMs: 2000 }).getPull(5);
+  assert.equal(pull.sha, sha(1));
+  const narrow = await tokens(COORDINATOR_PERMISSIONS).token();
+  assert.equal((await fetch(`${apiUrl}/repos/o/r/pulls/5`, { headers: { authorization: `Bearer ${narrow}` } })).status, 403);
+});
+
+test('reviewer/main.js: override and its dry-run stand-in use the same client as everything else, app or token file', () => {
+  const main = readFileSync(join(REPO, 'reviewer', 'main.js'), 'utf8');
+  const start = main.indexOf('function github() {');
+  const body = main.slice(start, main.indexOf('\nfunction dispatcher', start));
+  assert.match(body, /const real = realGitHub\(\);/, 'built from the one place that chooses');
+  assert.match(body, /getPull: \(n\) => real\.getPull\(n\)/, 'the dry-run stand-in can read the PR');
+  assert.match(body, /setStatus: async .*\[dry-run\]/, 'and does not post');
+  assert.match(main, /overrideCommand\(\{ args, store, github, /, 'override is handed that function, so bad settings stop it before it asks GitHub anything');
+});
+
+for (const [name, setup, expected] of [
+  ['takes the app settings the service was installed with', { install: true }, 'app=1,2 key=/installed/key.pem'],
+  ['lets what the operator exported win, with none taken from the service', { install: true, env: { REVIEW_APP_ID: '9' } }, 'app=9, key='],
+  ['takes nothing when the service is on its token file', { install: 'token' }, 'app=, key='],
+  ['takes nothing when the service is not installed', {}, 'app=, key='],
+]) {
+  test(`service/ops.sh override ${name}`, posixOnly, (t) => {
+    const f = fakeBin(t);
+    const tokenFile = join(f.home, 'the-token-file');
+    writeFileSync(tokenFile, 'x');
+    if (setup.install === true) {
+      const r = f.run('reviewer', { REVIEW_AUTHORS: 'alice', REVIEW_APP_ID: '1', REVIEW_APP_INSTALLATION_ID: '2', REVIEW_APP_KEY_FILE: '/installed/key.pem' });
+      assert.equal(r.status, 0, r.stdout + r.stderr);
+    }
+    if (setup.install === 'token') assert.equal(f.run('reviewer', { REVIEW_AUTHORS: 'alice', REVIEW_TOKEN_FILE: tokenFile }).status, 0);
+    const ops = spawnSync('bash', [join(REPO, 'service', 'ops.sh'), 'override', '5', '--reason', 'x'], {
+      encoding: 'utf8', timeout: 30_000, env: { PATH: f.path, HOME: f.home, ...setup.env },
+    });
+    assert.equal(ops.status, 0, ops.stdout + ops.stderr);
+    const last = f.calls().trim().split('\n').at(-1);
+    assert.ok(last.startsWith('node reviewer/main.js override 5 --reason x '), last);
+    assert.ok(last.endsWith(expected), last);
   });
 }

@@ -1,13 +1,15 @@
 import { renderComment } from './github.js';
 import { AUTH_HOLD_MS, upsertComment } from '../shared/github-auth.js';
+import { RUNNING } from '../shared/stop.js';
 
 // Applies stored events to GitHub. Retries with backoff; never regresses a task
 // to an older event (events are applied in timestamp order per task).
 export class Worker {
-  constructor({ store, github, log = () => {} }) {
+  constructor({ store, github, log = () => {}, stopState = () => RUNNING }) {
     this.store = store;
     this.github = github;
     this.log = log;
+    this.stopState = stopState;
     this.timer = null;
     this.running = false;
   }
@@ -24,6 +26,7 @@ export class Worker {
 
   async tick(now = Date.now()) {
     if (this.running) return;
+    if (this.stopState().stopped) return; // nothing goes to GitHub, and what is waiting uses up none of its attempts
     this.running = true;
     try {
       const failedTasks = new Set();

@@ -208,6 +208,36 @@ writable, only allowed environment variables. A canary file and the Docker socke
 reach both, so the review user's refusal means something. Its probes open and close files without reading them, and it never
 prints a file's contents.
 
+## Emergency stop and operator override (Mac mini)
+
+```bash
+service/ops.sh stop --reason "..."           # stop everything, until resume. Works with any service down.
+service/ops.sh resume                        # undo it; asks you to type the word
+service/ops.sh status                        # what is in force, and why
+service/ops.sh override <pr> --reason "..."  # adabra/review passes on the PR's current head commit; asks you to type the words
+```
+
+**While stopped:**
+
+| Part | What it does |
+|---|---|
+| Coordinator | Refuses claims, renewals, checkpoints and review results with `503 stopped` and the reason. Writes nothing to GitHub. Tasks are still listed, a claim can still be released, and the read-only task sync goes on. |
+| Held leases | Kept alive by the coordinator itself, so a stop of any length costs nobody a claim and no other device can take the task on resume. Same owner, same generation. A lease that had lapsed before the stop stays lapsed. |
+| Helpers | Tell their owner once, as for a lost claim, and keep their claims. `tasks` and `status` show the stop and its reason. Checkpoints wait in the outbox with no backoff and go in the first pass after resume. |
+| Reviewer | Starts nothing and posts nothing, and does not poll. A queued review stays queued and shows `pending`. A running job's container is ended within seconds, nothing about that run is posted, and it goes back to the queue without using up an attempt. Once posting has begun it finishes, so a result is never half-posted. |
+| Overnight runner | Must run `service/ops.sh check` before it starts anything and between steps: exit 0 = go; any other exit = do not start. It prints one line of JSON. From Node: `isStopped()` in `shared/stop.js`. |
+
+**Where it lives.** `~/.adabra-control/stop.json` (or `ADABRA_STOP_FILE`, if you set it for the services too). It belongs to no service, so `stop` works with any of them down, and each one reads it for itself. It is on disk, so a stop survives restarts and reboots. The file and its folder are readable by other users, so never put a secret in a reason. Only a missing file and a well-formed "not stopped" mean running; anything else that cannot be read counts as stopped. `resume` repairs a damaged file. `/healthz` also says `"stopped": true`.
+
+Run `resume` with the coordinator up: a lease that ran out while the coordinator was down is restored only if the coordinator comes back before the resume. `resume` warns you.
+
+**What a stop does not do.** It does not end a builder session already running on someone's machine: the owner is told, and that session can no longer claim or report progress, but it runs until someone ends it. It does not block `git push` or anything else that goes straight to GitHub.
+
+**Reasons are plain text.** One line, no controls, no working `@mentions`, no Markdown or HTML. An override's reason goes to the reviewer's log and never to GitHub; the status always reads `operator override`. A stop's reason goes to enrolled devices and never to GitHub.
+
+**Override** acts on the head commit it showed you, looked up again after you confirm. It refuses a closed or merged PR, and refuses while a review of that commit is queued or running, because the result would replace it. It never touches `adabra/tests`, so a PR whose tests failed stays blocked. A new push loses it, because statuses belong to a commit. It leaves a record in `~/Library/Logs/adabra-reviewer.log` (or `REVIEW_LOG_FILE`) before it posts: if it cannot write there, it does not post. It works during a stop, because it is a person's deliberate act and no job is involved.
+
+**Who may run what.** Agents may run `stop`, `status` and `check`: stopping is the safe direction. `resume` and `override` are for a person at the mini, like merging. Both need a terminal and a typed confirmation, and `.claude/settings.json` denies them. **That is a speed bump, not a boundary.** While builder sessions run as the same macOS user as the reviewer, an agent can fake a terminal, edit the state file or read the token or key. Deny rules only bind sessions that load this repo's settings. A hard boundary needs the planned separate builder user.
 ## GitHub App instead of personal tokens (Mac mini)
 
 By default each service uses its token file. Set a service's three app settings and it uses short-lived installation tokens
@@ -297,6 +327,10 @@ Settings > Applications > Installed GitHub Apps.
   handles a refusal: it leaves the old comment as it stands, posts one new comment and carries on with that one, and the log says
   `GitHub refused an edit`. Either way there is no retry loop and no event is lost. The same goes for switching back.
 - **`REVIEW_AUTHORS` is unaffected.** It lists who wrote a PR, and the app writes no PRs.
+- **`service/ops.sh override` posts as the reviewer does,** so it needs nothing new from you in an emergency. It takes the three app
+  settings from the reviewer's installed plist, unless you exported any of them yourself, and so it follows a switch in either
+  direction. The status comes from `<name>[bot]` and still reads `operator override`. Run `node reviewer/main.js override` directly
+  and only your shell's settings count, which without them means the token file.
 - **Required checks are unaffected** as long as they accept any source, which `main`'s do today. If someone pins a required check
   to a particular app in branch protection, it must be this one.
 
@@ -307,6 +341,11 @@ removed, the coordinator's events and the reviewer's jobs wait and retry every 3
 cannot go `dead` or `failed` this way, and they carry on by themselves once the problem is fixed. The log says `not counted as an
 attempt` and gives the reason. A wrong app ID or installation ID shows up this way as well, because a refusal from GitHub cannot
 be told apart from one on a bad day: that is what step 6 is for.
+
+An emergency stop comes first. While one is in force the worker and the reviewer attempt nothing and count nothing, and work held for
+an outage stays held. After `resume`, a problem that remains holds the work in the same way, and a token that expired during the stop
+is replaced on first use. A stop does not end the read-only task sync, which still asks GitHub for a token when it needs one: that
+writes nothing to the repository. `override` cannot post without a token: it says so, and posts nothing.
 
 ## Not built yet (by design)
 

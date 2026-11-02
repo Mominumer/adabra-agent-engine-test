@@ -3,6 +3,7 @@
 // 400/403/409/422 -> rejected, will not be retried (retrying cannot help)
 // 401            -> kept pending: usually a token/enrollment problem a human must fix
 // network, 5xx, 408, 429 -> retry with backoff
+// 503 `stopped`  -> the operator's emergency stop. Not a failed attempt: everything stays as it is, ready to go on resume.
 export async function flush({ outbox, url, deviceId, token, now = Date.now(), timeoutMs = 5000, log = () => {} }) {
   const results = { acked: 0, rejected: 0, retry: 0 };
   for (const row of outbox.due(now)) {
@@ -23,6 +24,15 @@ export async function flush({ outbox, url, deviceId, token, now = Date.now(), ti
       results.retry++;
       log(`retry ${row.event_id}: network error`);
       continue;
+    }
+
+    if (res.status === 503) {
+      const data = await res.json().catch(() => ({}));
+      if (data.error === 'stopped') {
+        results.stopped = data;
+        log('stopped by the operator: checkpoints wait in the outbox');
+        break;
+      }
     }
 
     if (res.ok) {

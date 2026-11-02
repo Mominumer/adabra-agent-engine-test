@@ -8,6 +8,7 @@
 //   node reviewer/main.js sandbox-check  prove the Docker sandbox is locked down (no PR needed)
 //   node reviewer/main.js review-check   prove the review user's containment (no PR, no token, no model call; needs service/review-user.sh)
 //   node reviewer/main.js github-check   do these GitHub settings work? reads only, opens no database
+//   node reviewer/main.js override <pr> --reason "..."   operator only, at a terminal: see override.js and service/ops.sh
 //
 // Environment:
 //   GITHUB_REPO          owner/name
@@ -21,6 +22,8 @@
 //   REVIEW_IMAGE         sandbox image, pulled beforehand (default node:26-slim; pin by digest)
 //   REVIEW_TEST_CMD      command run on the PR inside the sandbox (default: npm test)
 //   REVIEW_TIMEOUT_MS    per-job limit (default 900000 = 15 min)
+//   REVIEW_LOG_FILE      where override leaves its record (default ~/Library/Logs/adabra-reviewer.log, the service's log)
+//   ADABRA_STOP_FILE     the operator's emergency stop (default ~/.adabra-control/stop.json); see service/ops.sh
 //
 // Telling the coordinator how a task's review went (off unless the device identity is set; reviews run the same either way):
 //   REVIEW_DEVICE_ID          this reviewer's enrolled device, role reviewer (coordinator: device-add <id> reviewer)
@@ -37,6 +40,8 @@ import { mockReview } from './review-mock.js';
 import { Sandbox, selfCheck } from './sandbox.js';
 import { startTaskResults } from './task-results.js';
 import { reviewCheck } from './review-check.js';
+import { overrideCommand } from './override.js';
+import { isStopped, readStop, stopLine, watchStop } from '../shared/stop.js';
 import { appAuthFromEnv, gitHubCheck } from '../shared/github-auth.js';
 
 const log = (m) => console.log(`${new Date().toISOString()} ${m}`);
@@ -90,6 +95,7 @@ function github() {
   let id = 5000;
   return {
     openPulls: () => real.openPulls(), // reading is harmless
+    getPull: (n) => real.getPull(n),
     downloadTarball: (sha) => real.downloadTarball(sha),
     compareFiles: (base, sha) => real.compareFiles(base, sha),
     setStatus: async (sha, ctx, state, d) => log(`[dry-run] status ${sha.slice(0, 12)} ${ctx}=${state}: ${d}`),
@@ -104,20 +110,30 @@ function dispatcher({ linkTasks = false } = {}) {
   if (!authors.length) throw new Error('REVIEW_AUTHORS is empty: list the GitHub logins allowed to run code on the mini');
   const gh = github();
   return new Dispatcher({
-    store, github: gh, repo: process.env.GITHUB_REPO, authors, log, linkTasks,
+    store, github: gh, repo: process.env.GITHUB_REPO, authors, log, linkTasks, isStopped,
     runTests: sandbox.testRunner(gh),
     runReview: mockReview(gh), // later: the real Claude review skill, same contract
   });
 }
 
 if (cmd === 'serve') {
-  const d = dispatcher({ linkTasks: startTaskResults({ store, log }).linkTasks });
+  const d = dispatcher({ linkTasks: startTaskResults({ store, log, isStopped }).linkTasks });
   const pollMs = Number(process.env.REVIEW_POLL_MS ?? 60_000);
   const stale = await sandbox.cleanup();
   if (stale) log(`removed ${stale} sandbox container(s) left by a previous run`);
   const n = store.requeueInterrupted();
   if (n) log(`re-queued ${n} job(s) interrupted by a restart`);
   log(`reviewer started for ${process.env.GITHUB_REPO}, polling every ${pollMs / 1000}s`);
+  // On a stop, end a running job's containers within seconds. Again on each pass, in case the job has just started another one.
+  await watchStop({
+    log,
+    intervalMs: 2000,
+    whileStopped: async () => {
+      if (!d.interrupt()) return;
+      const ended = await sandbox.cleanup();
+      if (ended) log(`stop: ended ${ended} sandbox container(s)`);
+    },
+  }).pass();
   let lastPoll = 0;
   for (;;) {
     if (Date.now() - lastPoll >= pollMs) {
@@ -129,7 +145,11 @@ if (cmd === 'serve') {
   }
 } else if (cmd === 'poll-once') {
   console.log(`queued ${await dispatcher().poll()} new commit(s)`);
+} else if (cmd === 'override') {
+  process.exit(await overrideCommand({ args, store, github, dryRun: process.env.REVIEW_DRY_RUN === '1' }));
 } else if (cmd === 'status') {
+  const stop = readStop();
+  if (stop.stopped) console.log(`${stopLine(stop)}\nNo job starts until the operator resumes; queued jobs stay queued.`);
   console.log(store.counts());
   for (const j of store.recent(10)) {
     const res = j.result ? `tests ${j.result.tests}, review ${j.result.review}` : (j.last_error ?? '');
@@ -148,6 +168,6 @@ if (cmd === 'serve') {
 } else if (cmd === 'retry' && Number.isInteger(Number(args[0]))) {
   console.log(store.retry(Number(args[0])) ? `PR #${args[0]} queued again` : `no jobs for PR #${args[0]}`);
 } else {
-  console.error('usage: main.js serve | poll-once | status | retry <pr> | sandbox-check | review-check | github-check');
+  console.error('usage: main.js serve | poll-once | status | retry <pr> | sandbox-check | review-check | github-check | override <pr> --reason "..."');
   process.exit(2);
 }
