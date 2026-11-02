@@ -22,7 +22,7 @@
 //   GITHUB_APP_ID, GITHUB_APP_INSTALLATION_ID, GITHUB_APP_KEY_FILE
 //                           use a GitHub App instead of the token file: all three, or none. See the README.
 //   GITHUB_DRY_RUN=1        log what would be posted instead of calling GitHub
-//   ADABRA_STOP_FILE        the operator's emergency stop (default ~/.adabra-control/stop.json); see service/ops.sh
+//   ADABRA_STOP_FILE        the operator's emergency stop (default /opt/adabra-control/stop.json if that folder exists, otherwise ~/.adabra-control/stop.json); see service/ops.sh
 import { readFileSync } from 'node:fs';
 import { ROLES, Store } from './store.js';
 import { VERDICT_TEXT } from '../shared/review-result.js';

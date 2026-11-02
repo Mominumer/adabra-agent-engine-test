@@ -9,6 +9,8 @@
 #   service/ops.sh health --last                 what the health job found last, without checking anything again
 #   service/ops.sh override <pr> --reason "..."  mark adabra/review as passed on the PR's current head commit. Typed confirmation
 #                                                at a terminal. Agents must not run it, the same as merging.
+#   service/ops.sh switch-stop                   move the stop to /opt/adabra-control, once. Typed confirmation and sudo, at a terminal.
+#                                                Agents must not run it. The README has the steps that go with it.
 #
 # Settings for override (override by exporting first):
 #   GITHUB_REPO         default Mominumer/adabra-agent-engine-test
@@ -24,7 +26,7 @@ REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_DIR"
 
 case "${1:-}" in
-  stop|resume|status|check)
+  stop|resume|status|check|switch-stop)
     exec node ops/main.js "$@"
     ;;
   health)
@@ -47,6 +49,6 @@ case "${1:-}" in
     exec node reviewer/main.js "$@"
     ;;
   *)
-    echo "usage: $0 stop [--reason \"...\"] | resume | status | check | health [--last] | override <pr> --reason \"...\""; exit 2
+    echo "usage: $0 stop [--reason \"...\"] | resume | status | check | health [--last] | override <pr> --reason \"...\" | switch-stop"; exit 2
     ;;
 esac

@@ -22,6 +22,8 @@
       "Bash(*ops.sh override*)",
       "Bash(*main.js resume*)",
       "Bash(*ops.sh resume*)",
+      "Bash(*main.js switch-stop*)",
+      "Bash(*ops.sh switch-stop*)",
       "Bash(rm *adabra-control*)",
       "Bash(mv *adabra-control*)",
       "Bash(*> *adabra-control*)",
@@ -29,7 +31,9 @@
       "Bash(expect *)",
       "Bash(unbuffer *)",
       "Edit(~/.adabra-control/**)",
-      "Write(~/.adabra-control/**)"
+      "Write(~/.adabra-control/**)",
+      "Edit(//opt/adabra-control/**)",
+      "Write(//opt/adabra-control/**)"
     ],
     "allow": [
       "Bash(npm test)",

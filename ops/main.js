@@ -8,11 +8,12 @@
 //   node ops/main.js health                  the health report, read-only: see ops/health.js. Exit 1 if any line is a FAIL
 //   node ops/main.js health --last           what the health job found last, without checking anything again
 //   node ops/main.js health --job            the LaunchAgent's run: also rotates logs, writes the status file, and notifies
+//   node ops/main.js switch-stop             move the stop to the machine folder, once; typed confirmation and sudo; agents must not run this
 //
-// Environment: ADABRA_STOP_FILE (default ~/.adabra-control/stop.json)
+// Environment: ADABRA_STOP_FILE (default /opt/adabra-control/stop.json if that folder exists, otherwise ~/.adabra-control/stop.json)
 //
 // The override for adabra/review is `node reviewer/main.js override`, because it belongs with the reviewer's GitHub client.
-import { checkCommand, resumeCommand, statusCommand, stopCommand } from './commands.js';
+import { checkCommand, resumeCommand, statusCommand, stopCommand, switchStopCommand } from './commands.js';
 
 const [cmd, ...args] = process.argv.slice(2);
 const commands = {
@@ -20,12 +21,13 @@ const commands = {
   resume: () => resumeCommand(),
   status: () => statusCommand(),
   check: () => checkCommand(),
+  'switch-stop': () => switchStopCommand(),
   // Loaded only when asked for: nothing in the health code can ever get in the way of stopping.
   health: async () => (await import('./health.js')).healthCommand({ args }),
 };
 
 if (!Object.hasOwn(commands, cmd ?? '')) {
-  console.error('usage: main.js stop [--reason "..."] | resume | status | check | health [--last | --job]');
+  console.error('usage: main.js stop [--reason "..."] | resume | status | check | health [--last | --job] | switch-stop');
   process.exit(2);
 }
 process.exit(await commands[cmd]());

@@ -29,7 +29,7 @@
 //   REVIEW_DAILY_CAP     real review runs allowed per UTC day (default 30)
 //   REVIEW_UNSHOWN_OK    comma-separated extensions a changed file may have when GitHub will not show it (default: images and fonts)
 //   REVIEW_LOG_FILE      where override leaves its record (default ~/Library/Logs/adabra-reviewer.log, the service's log)
-//   ADABRA_STOP_FILE     the operator's emergency stop (default ~/.adabra-control/stop.json); see service/ops.sh
+//   ADABRA_STOP_FILE     the operator's emergency stop (default /opt/adabra-control/stop.json if that folder exists, otherwise ~/.adabra-control/stop.json); see service/ops.sh
 //   REVIEW_RUNS_DIR      where the live check and the seeded run keep their local results (default ~/.adabra-review-runs)
 //
 // Telling the coordinator how a task's review went (off unless the device identity is set; reviews run the same either way):

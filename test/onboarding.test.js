@@ -56,6 +56,7 @@ function env(extra = {}) {
     HOME: world.userHome,
     TEAM_AGENT_HOME: join(world.dir, 'no-test-should-use-this-home'), // tests about the usual home clear this and set HOME
     COORDINATOR_DB: world.db,
+    ADABRA_STOP_FILE: join(world.dir, 'no-stop.json'), // the machine-wide stop would otherwise reach the coordinator these tests start
     NODE_OPTIONS: `--import=${world.recorder}`,
     ONBOARD_RECORD: world.record,
     ONBOARD_TOOL_LOG: world.toolLog,
