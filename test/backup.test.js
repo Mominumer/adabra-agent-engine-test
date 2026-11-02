@@ -610,7 +610,7 @@ test('drill: restores the newest backup to a temp copy, prints only table names 
   assert.equal(r.ok, true, r.text);
   assert.match(r.text, new RegExp(`coordinator: ${newest}`), 'the newest');
   assert.match(r.text, /tables: claims 0, devices 2, events 50, review_results 0, task_reviews 0, tasks 2/);
-  assert.match(r.text, /tables: jobs 1, prs 0, task_results 0/);
+  assert.match(r.text, /tables: jobs 1, prs 0, review_pause 0, review_runs 0, task_results 0/);
   assert.match(r.text, /integrity_check: ok/);
   assert.match(r.text, /drill passed$/);
   assert.doesNotMatch(r.text, new RegExp(SECRET));
