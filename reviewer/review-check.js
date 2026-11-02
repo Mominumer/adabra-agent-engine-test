@@ -10,6 +10,8 @@ import { HOSTILE_KEPT, hostileTarball } from './tar.js';
 // sandbox-check: one line per check, and any failure means the real review must not be built on top of this.
 // Nothing here reads or prints a protected file: the wrapper's probes open and close without reading, and a result is one of
 // a few fixed words. The one file read back is the canary this check itself wrote.
+// Nothing here can spend, even with the model step enabled: the wrapper starts the model only for a job holding the paid mark, and
+// the jobs built here never hold it. So a wrapper call with a real job, or with any other id, ends before the credential is loaded.
 export const OPT = '/opt/adabra-review';
 const REVIEW_SHA = 'c'.repeat(40);
 const ROOT_OWNED = [
@@ -95,13 +97,14 @@ export async function reviewCheck({ sandbox, opt = OPT, sudo = '/usr/bin/sudo', 
   const reviewUser = paths.REVIEW_USER;
   const wrapper = join(opt, 'bin', 'run-review');
   const jobRoot = join(opt, 'in');
+  const modelEnabled = existsSync(join(opt, 'etc', 'model-enabled'));
   const canaryName = `ADABRA_CANARY_${randomBytes(4).toString('hex')}`;
   const env = { ...process.env, [canaryName]: 'must not reach the review user' };
   // The dispatcher's folders are closed to the review user, so sudo must not start from one of them.
   const asReview = (args, extraArgs = []) => run(sudo, ['-n', ...extraArgs, '-u', reviewUser, wrapper, ...args], { env, cwd: opt });
 
   // What only root may change.
-  for (const rel of ROOT_OWNED) {
+  for (const rel of [...ROOT_OWNED, ...(modelEnabled ? ['etc/model-enabled'] : [])]) {
     const path = join(opt, rel);
     let got = 'missing';
     if (existsSync(path)) {
@@ -166,6 +169,8 @@ export async function reviewCheck({ sandbox, opt = OPT, sudo = '/usr/bin/sudo', 
     const seen = parseProbes(r.stdout);
     results.push(...judgeProbes(seen, { reviewUser, canaryName }));
     results.push(pass('job.group_is_review_user', seen.gid ?? 'not reported', String(root?.gid ?? 'missing')));
+    // A wrapper from before the model step does not report this, and has no model step to be on.
+    results.push(pass('wrapper.model_step', modelEnabled ? 'on' : 'off', seen.model_step ?? 'off'));
     results.push(pass('output.no_canary_text', 'clean', `${r.stdout}${r.stderr}`.includes(canaryText) ? 'LEAKED' : 'clean'));
 
     // The wrapper's front door.
@@ -183,8 +188,11 @@ export async function reviewCheck({ sandbox, opt = OPT, sudo = '/usr/bin/sudo', 
     const twoArgs = await asReview([job.id, 'extra']);
     results.push(pass('wrapper.extra_argument', 'exit 64', `exit ${twoArgs.code}`));
 
+    // Off: refused because the step is off. On: refused because this job has no paid mark. Both end before the credential is
+    // loaded, and if someone enables the step while this runs, the answer only fails to match. It still cannot reach the model.
     const off = await asReview([job.id]);
-    results.push(pass('wrapper.no_model_step', 'exit 78', `exit ${off.code}`));
+    if (modelEnabled) results.push(pass('wrapper.unmarked_job_refused', 'exit 79', `exit ${off.code}`));
+    else results.push(pass('wrapper.no_model_step', 'exit 78', `exit ${off.code}`));
     results.push(pass('wrapper.no_model_output', 'none', off.stdout === '' ? 'none' : 'SOME'));
 
     // Links are how a job could point the review user at its own files.

@@ -2,8 +2,12 @@
 # Installs what the separate review user runs: a root-owned wrapper with its settings, the job directory root, and one sudoers
 # line. Run it with sudo, as the user who runs the review dispatcher.
 #
-#   sudo service/review-user.sh install     install or update (safe to re-run); a PR changes nothing until this runs
-#   sudo service/review-user.sh uninstall   remove them and the sudoers line; keeps the user, its login and the CLI
+#   sudo service/review-user.sh install                  install or update (safe to re-run), with the model step OFF
+#   sudo service/review-user.sh install --enable-model   the same, and turns the model step on: reviews can then spend
+#   sudo service/review-user.sh uninstall                remove them and the sudoers line; keeps the user, its login and the CLI
+#
+# A PR changes nothing here until this runs. Only --enable-model creates the file that turns the model step on, and a plain install
+# removes it, so turning it off is one command and re-running the installer never turns it on by accident.
 #
 # Needs first: the review user, with its own primary group and not an admin; both home folders at mode 700; a root-owned CLI at
 # /opt/adabra-review/bin/claude. Afterwards, without sudo: node reviewer/main.js review-check
@@ -25,9 +29,12 @@ home_of() { dscl . -read "/Users/$1" NFSHomeDirectory 2>/dev/null | awk '{print 
 safe_path() { [[ "$1" =~ ^/[A-Za-z0-9._/-]+$ ]]; }
 
 CMD="${1:-}"
-case "$CMD" in
-  install | uninstall) ;;
-  *) echo "usage: sudo $0 install | uninstall"; exit 2 ;;
+OPTION="${2:-}"
+usage() { echo "usage: sudo $0 install [--enable-model] | uninstall"; exit 2; }
+[ $# -le 2 ] || usage
+case "$CMD:$OPTION" in
+  install: | install:--enable-model | uninstall:) ;;
+  *) usage ;;
 esac
 [ "$(id -u)" = 0 ] || die "run this with sudo: sudo $0 $CMD"
 [ "$(uname)" = Darwin ] || die "this is for macOS"
@@ -40,6 +47,9 @@ if [ "$CMD" = uninstall ]; then
   echo "kept: the $RU user, its home and login, and $OPT/bin/claude"
   exit 0
 fi
+
+# Before anything below can stop this: whatever else goes wrong, an install leaves the model step off until its very last step.
+rm -f "$OPT/etc/model-enabled"
 
 OWNER="${SUDO_USER:-}"
 [[ "$OWNER" =~ ^[a-z_][a-z0-9_-]*$ ]] && [ "$OWNER" != root ] && [ "$OWNER" != "$RU" ] \
@@ -112,6 +122,16 @@ echo "== Starting the wrapper once as $RU"
 cd /
 sudo -n -u "$RU" "$OPT/bin/run-review" check >/dev/null || die "the wrapper did not run as $RU"
 ok "it runs"
+
+echo "== The model step"
+if [ "$OPTION" = --enable-model ]; then
+  : > "$OPT/etc/model-enabled"
+  chown root:wheel "$OPT/etc/model-enabled"
+  chmod 644 "$OPT/etc/model-enabled"
+  ok "ON: a job the dispatcher marks as paid now calls the model and can spend"
+else
+  ok "off: the wrapper exits 78 and never loads the credential"
+fi
 
 echo
 echo "Done. Now run this without sudo, from $REPO_DIR:"

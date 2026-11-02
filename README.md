@@ -179,8 +179,9 @@ ends it, as does `node coordinator/main.js task-assign TASK-7 <device-id|none>`.
 ## Review user containment (Mac mini, no model yet)
 
 The real review will read untrusted PR text, so it runs as a separate macOS user that holds no GitHub token and cannot enter the
-dispatcher's home folder. This part builds and proves that boundary. **Nothing here can call Claude**: the wrapper has no model
-step, never loads the credential, and exits 78 if asked to review. `adabra/review` is still the mock.
+dispatcher's home folder. This part builds and proves that boundary. **A plain install cannot call Claude**: the wrapper's model
+step is switched off, it never loads the credential, and it exits 78 if asked to review. `adabra/review` is still the mock unless
+`REVIEW_ENGINE` says otherwise (below).
 
 ```
 dispatcher (holds the review GitHub token)
@@ -200,6 +201,7 @@ what was dropped. A change to a dropped file still shows as text in `diff.patch`
 sudo service/review-user.sh install        # root-owned wrapper and settings, the job root, one sudoers line; safe to re-run
 node reviewer/main.js review-check         # must end with "review user is contained"; needs no sudo, token or database
 sudo service/review-user.sh uninstall      # removes them; keeps the user, its login and the CLI
+sudo service/review-user.sh install --enable-model   # also turns the model step on: reviews can then spend. A plain install turns it off
 ```
 
 The wrapper and its settings are copies owned by root, so a merged PR changes nothing here until the installer runs again.
@@ -207,6 +209,45 @@ The wrapper and its settings are copies owned by root, so a merged PR changes no
 writable, only allowed environment variables. A canary file and the Docker socket are its positive controls: the dispatcher can
 reach both, so the review user's refusal means something. Its probes open and close files without reading them, and it never
 prints a file's contents.
+
+`review-check` cannot spend, with the model step on or off. To start the model the wrapper needs both the root-owned
+`etc/model-enabled` (absent: exit 78) and a `paid-run` mark in the job directory (absent: exit 79). Only the dispatcher's paid path
+writes that mark; the jobs `review-check` builds never hold it, and a PR's files all go under `tree/`, where the mark does not count.
+
+## The real review's output handling
+
+```
+REVIEW_ENGINE=mock     (default) the mock decides. No job directory, no sudo, nothing paid
+REVIEW_ENGINE=shadow   the mock decides; the real review also runs and posts only a verdict to adabra/review-shadow, not required.
+                       Its findings stay in the local log
+REVIEW_ENGINE=claude   the real review decides adabra/review
+REVIEW_DAILY_CAP=30    real review runs per UTC day, counted before each one starts, retries included
+```
+
+Before anything is spent: if the tests did not pass, `adabra/review` is `error` ("Skipped: tests failed"). Checks that need no model
+can only block: an added `debugger;`, hidden Unicode, a changed file GitHub will not show (unless it is an image or font, or
+`REVIEW_UNSHOWN_OK` lists its extension), a diff of 100 files or 256 KB. The PR's head is compared with the commit just before the
+run. A valid result is stored by PR, commit, skill and model, so a retry after GitHub failed, or a restart, does not pay again.
+
+What comes back is untrusted, so the dispatcher checks it itself: the result's type, subtype and `is_error` together, its own check
+against `reviewer/review-user/review-schema.json`, the commit, the verdict against the findings, every file against the job, and an
+empty list of denied tool calls. Anything else is `error`; nothing but a fully valid `pass` is `success`. Status text is fixed
+strings or counts, so the model's words never reach a status, and the CLI's own text goes only to the local log. Findings go in the
+PR comment inside a code block, where no link, image or HTML can take effect, followed by a list of paths to read yourself. The
+review is advisory: a pass means the reviewer raised no blocker, not that the change is safe.
+
+| Failure | `adabra/review` | What happens next |
+|---|---|---|
+| Account limit, or 402/429 | `error`: paused | All real reviews wait until the stated reset, or 1 h doubling to 6 h. One job probes when it ends. Uses no attempts |
+| Not logged in, bad credential, 401/403, model step off | `error`: operator action needed | All real reviews wait for `retry <pr>` or a restart. Uses no attempts |
+| Daily cap | `error`: daily limit | Until 00:00 UTC. Uses no attempts |
+| 5xx, network | `error` | Backs off, at most 3 attempts on a commit, then final |
+| Turn, budget or time limit; invalid output | `error`, final | No automatic retry. `retry <pr>` runs it again |
+| Anything unrecognised | `error` | Retried like the row above, and three in a row open the same pause as an account limit |
+
+While reviews are paused the tests still run and `adabra/tests` still posts its real result. A pause is kept in `reviewer.db` across
+restarts, except the one waiting for the operator, which a restart lifts. `node reviewer/main.js status` shows the pause and the
+day's count.
 
 ## Not built yet (by design)
 

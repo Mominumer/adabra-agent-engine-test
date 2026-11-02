@@ -55,6 +55,12 @@ export class ReviewGitHub {
     return out;
   }
 
+  // Where the PR is right now, asked just before paying for a review of one of its commits.
+  async pullHead(pr) {
+    const p = await this.#req('GET', `/repos/${this.repo}/pulls/${pr}`);
+    return { sha: p.head?.sha ?? null, open: p.state === 'open' };
+  }
+
   // state: pending | success | failure | error. GitHub limits description to 140 characters.
   async setStatus(sha, context, state, description) {
     await this.#req('POST', `/repos/${this.repo}/statuses/${sha}`, {

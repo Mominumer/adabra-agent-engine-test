@@ -16,6 +16,9 @@
 #   REVIEW_DEVICE_ID    this reviewer's enrolled device, role reviewer. Unset: tasks are not told review results
 #   REVIEW_DEVICE_TOKEN_FILE  default ~/.adabra/reviewer-device-token (that device's token, not a GitHub token)
 #   REVIEW_COORDINATOR_URL    e.g. http://127.0.0.1:8787
+#   REVIEW_ENGINE       default mock. shadow and claude also need: sudo service/review-user.sh install --enable-model
+#   REVIEW_DAILY_CAP    default 30 real review runs per UTC day
+#   REVIEW_UNSHOWN_OK   extensions a changed file may have when GitHub will not show it (default: images and fonts)
 set -euo pipefail
 
 LABEL="ai.adabra.reviewer"
@@ -35,6 +38,9 @@ case "${1:-}" in
     REVIEW_DEVICE_ID="${REVIEW_DEVICE_ID:-}"
     REVIEW_DEVICE_TOKEN_FILE="${REVIEW_DEVICE_TOKEN_FILE:-$HOME/.adabra/reviewer-device-token}"
     REVIEW_COORDINATOR_URL="${REVIEW_COORDINATOR_URL:-}"
+    REVIEW_ENGINE="${REVIEW_ENGINE:-mock}"
+    REVIEW_DAILY_CAP="${REVIEW_DAILY_CAP:-30}"
+    REVIEW_UNSHOWN_OK="${REVIEW_UNSHOWN_OK:-}"
     [ -n "${REVIEW_AUTHORS:-}" ] || { echo "set REVIEW_AUTHORS, e.g. REVIEW_AUTHORS=alice,bob $0 install"; exit 1; }
     [ -f "$REVIEW_TOKEN_FILE" ] || { echo "missing review token file: $REVIEW_TOKEN_FILE"; exit 1; }
     mkdir -p "$(dirname "$PLIST")" "$(dirname "$LOG")"
@@ -58,6 +64,9 @@ case "${1:-}" in
     <key>REVIEW_DEVICE_ID</key><string>$REVIEW_DEVICE_ID</string>
     <key>REVIEW_DEVICE_TOKEN_FILE</key><string>$REVIEW_DEVICE_TOKEN_FILE</string>
     <key>REVIEW_COORDINATOR_URL</key><string>$REVIEW_COORDINATOR_URL</string>
+    <key>REVIEW_ENGINE</key><string>$REVIEW_ENGINE</string>
+    <key>REVIEW_DAILY_CAP</key><string>$REVIEW_DAILY_CAP</string>
+    <key>REVIEW_UNSHOWN_OK</key><string>$REVIEW_UNSHOWN_OK</string>
     <key>PATH</key><string>$HOME/.docker/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
   </dict>
   <key>RunAtLoad</key><true/>
