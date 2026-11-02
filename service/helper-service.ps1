@@ -7,6 +7,7 @@
 #   powershell -NoProfile -ExecutionPolicy Bypass -File service\helper-service.ps1 status      is it running, and what did the last pass do
 #   powershell -NoProfile -ExecutionPolicy Bypass -File service\helper-service.ps1 logs        follow the log
 #   powershell -NoProfile -ExecutionPolicy Bypass -File service\helper-service.ps1 uninstall   stop it and remove the task
+#   powershell -NoProfile -ExecutionPolicy Bypass -File service\helper-service.ps1 protect     make TEAM_AGENT_HOME private to this user (onboarding uses this)
 #
 # What runs: Task Scheduler -> wscript.exe helper-launcher.js (no window) -> node helper\supervisor.js -> node helper\agent.js
 # How it comes back:
@@ -277,6 +278,12 @@ switch ($Command) {
         Remove-AgentTask
         Stop-AgentProcesses
         Write-Output "removed $TaskName"
+    }
+    'protect' {
+        # For onboarding/setup.js: make the folder private before a token goes in, and report who else can open what is there.
+        $null = New-Item -ItemType Directory -Force -Path $AgentHome
+        Protect-AgentHome
+        Show-AccessWarnings
     }
     default {
         Write-Output 'usage: helper-service.ps1 install | status | logs | uninstall'
