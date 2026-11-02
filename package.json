@@ -4,9 +4,11 @@
   "private": true,
   "type": "module",
   "description": "Milestone 2 test: helper outbox -> coordinator -> GitHub issue comment",
-  "engines": { "node": ">=22.13" },
+  "engines": {
+    "node": ">=22.13"
+  },
   "scripts": {
-    "test": "node --test test/",
+    "test": "node hostile.js",
     "coordinator": "node coordinator/main.js",
     "agent": "node helper/cli.js"
   }
