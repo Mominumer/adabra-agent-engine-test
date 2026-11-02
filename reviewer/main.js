@@ -22,6 +22,10 @@
 //   REVIEW_IMAGE         sandbox image, pulled beforehand (default node:26-slim; pin by digest)
 //   REVIEW_TEST_CMD      command run on the PR inside the sandbox (default: npm test)
 //   REVIEW_TIMEOUT_MS    per-job limit (default 900000 = 15 min)
+//   REVIEW_ENGINE        mock (default), shadow (the mock decides, the real review only reports to adabra/review-shadow) or claude.
+//                        The real review also needs: sudo service/review-user.sh install --enable-model
+//   REVIEW_DAILY_CAP     real review runs allowed per UTC day (default 30)
+//   REVIEW_UNSHOWN_OK    comma-separated extensions a changed file may have when GitHub will not show it (default: images and fonts)
 //   REVIEW_LOG_FILE      where override leaves its record (default ~/Library/Logs/adabra-reviewer.log, the service's log)
 //   ADABRA_STOP_FILE     the operator's emergency stop (default ~/.adabra-control/stop.json); see service/ops.sh
 //
@@ -36,7 +40,7 @@ import { join } from 'node:path';
 import { ReviewStore } from './store.js';
 import { REVIEW_PERMISSIONS, ReviewGitHub } from './github.js';
 import { Dispatcher } from './dispatcher.js';
-import { mockReview } from './review-mock.js';
+import { reviewEngine } from './review-claude.js';
 import { Sandbox, selfCheck } from './sandbox.js';
 import { startTaskResults } from './task-results.js';
 import { reviewCheck } from './review-check.js';
@@ -54,6 +58,10 @@ const sandbox = new Sandbox({
 
 // Before the database opens: this check needs neither the queue nor a token.
 if (cmd === 'review-check') {
+  if (args.length) {
+    console.error('review-check takes no options: the live run is not built yet, and this check never calls a model');
+    process.exit(2);
+  }
   let r;
   try {
     await sandbox.ensureDocker();
@@ -112,7 +120,7 @@ function dispatcher({ linkTasks = false } = {}) {
   return new Dispatcher({
     store, github: gh, repo: process.env.GITHUB_REPO, authors, log, linkTasks, isStopped,
     runTests: sandbox.testRunner(gh),
-    runReview: mockReview(gh), // later: the real Claude review skill, same contract
+    ...reviewEngine({ github: gh, store, sandbox, log }),
   });
 }
 
@@ -123,6 +131,7 @@ if (cmd === 'serve') {
   if (stale) log(`removed ${stale} sandbox container(s) left by a previous run`);
   const n = store.requeueInterrupted();
   if (n) log(`re-queued ${n} job(s) interrupted by a restart`);
+  d.start();
   log(`reviewer started for ${process.env.GITHUB_REPO}, polling every ${pollMs / 1000}s`);
   // On a stop, end a running job's containers within seconds. Again on each pass, in case the job has just started another one.
   await watchStop({
@@ -151,6 +160,10 @@ if (cmd === 'serve') {
   const stop = readStop();
   if (stop.stopped) console.log(`${stopLine(stop)}\nNo job starts until the operator resumes; queued jobs stay queued.`);
   console.log(store.counts());
+  const pause = store.reviewPause(Date.now());
+  if (pause) console.log(`real reviews paused (${pause.kind}) ${pause.until ? `until ${new Date(pause.until).toISOString()}` : 'until retry or a restart'}`);
+  const paidToday = store.paidRunsOn(Date.now());
+  if (paidToday) console.log(`real review runs today (UTC): ${paidToday}`);
   for (const j of store.recent(10)) {
     const res = j.result ? `tests ${j.result.tests}, review ${j.result.review}` : (j.last_error ?? '');
     console.log(`PR #${j.pr} ${j.sha.slice(0, 12)} ${j.state} (attempts ${j.attempts}) ${res}`);

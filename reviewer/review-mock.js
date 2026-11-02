@@ -3,25 +3,11 @@
 // It only reads text from GitHub; it never runs PR code. Deterministic rules, so the blocking path can be tested:
 //   - the PR title or description contains "MOCK-REVIEW: fail"  -> blocker
 //   - a line ADDED by the PR contains "debugger;"                -> blocker at that file and line
+import { debuggerFindings } from './precheck.js';
+
+export { addedLines } from './precheck.js';
 export const REVIEWER = 'mock-v1';
 const FAIL_MARK = 'MOCK-REVIEW: fail';
-
-// Line numbers (in the new file) of every line the patch adds.
-export function addedLines(patch) {
-  const out = [];
-  let line = 0;
-  for (const l of (patch ?? '').split('\n')) {
-    const h = l.match(/^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
-    if (h) {
-      line = Number(h[1]);
-      continue;
-    }
-    if (l.startsWith('+')) out.push({ line: line++, text: l.slice(1) });
-    else if (l.startsWith(' ')) line++;
-    // '-' lines and '\ No newline' do not exist in the new file
-  }
-  return out;
-}
 
 export function mockReview(github) {
   return async (job) => {
@@ -37,11 +23,7 @@ export function mockReview(github) {
         skipped++; // binary or too large for GitHub to show
         continue;
       }
-      for (const a of addedLines(f.patch)) {
-        if (a.text.includes('debugger;')) {
-          findings.push({ file: f.filename, line: a.line, severity: 'blocker', message: 'Leftover `debugger;` statement.' });
-        }
-      }
+      findings.push(...debuggerFindings(f));
     }
     if (truncated) findings.push({ file: null, line: null, severity: 'minor', message: 'More than 300 files changed; only the first 300 were reviewed.' });
     const blockers = findings.filter((f) => f.severity === 'blocker').length;

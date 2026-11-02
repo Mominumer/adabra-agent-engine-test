@@ -277,7 +277,7 @@ test('untrusted text cannot ping people or break out of the log block', async ()
     await t.d.runOnce();
     const body = t.gh.comments[0].body;
     assert.doesNotMatch(body, /(^|[^​])@(everyone|octocat|admin)/);
-    assert.equal(body.split('```').length - 1, 2, 'only our own fence opens and closes the log');
+    assert.equal(body.split('```').length - 1, 4, 'only our own fences open and close the findings and the log');
   } finally {
     await t.teardown();
   }
