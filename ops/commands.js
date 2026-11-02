@@ -64,7 +64,7 @@ async function coordinatorAnswers(env = process.env) {
 
 // The dangerous direction: only a person at a terminal, who has typed the word.
 export async function resumeCommand({
-  machineDir = MACHINE_DIR, path = stopFilePath(undefined, undefined, machineDir), terminal = hasTerminal(), confirm = typed, coordinatorUp = coordinatorAnswers, say = console.log, at = new Date(),
+  machineDir = MACHINE_DIR, path = stopFilePath(undefined, undefined, machineDir), terminal = hasTerminal(), confirm = typed, coordinatorUp = coordinatorAnswers, say = console.log,
 } = {}) {
   if (!terminal) {
     say('resume needs an interactive terminal: the operator runs it at the mini. Agents must not. Nothing changed.');
@@ -86,7 +86,7 @@ export async function resumeCommand({
     return 1;
   }
   try {
-    recordResume({ at, path, machineDir });
+    recordResume({ at: new Date(), path, machineDir }); // now, and not when the prompt appeared: someone may take minutes to type
   } catch (err) {
     say(`RESUME FAILED, still stopped: could not write ${path}: ${err.code ?? err.message}`);
     return 1;
