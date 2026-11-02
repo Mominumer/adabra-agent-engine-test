@@ -14,6 +14,7 @@ export function normalize(r, step) {
     summary: String(r.summary ?? '').slice(0, 500),
     findings: Array.isArray(r.findings) ? r.findings.slice(0, 50) : [],
     log: String(r.log ?? ''),
+    reviewer: r.reviewer ? String(r.reviewer).slice(0, 40) : null,
   };
 }
 
@@ -43,7 +44,8 @@ export function renderComment(job, tests, review) {
     const tail = tests.log.length > 3000 ? `…\n${tests.log.slice(-3000)}` : tests.log;
     lines.push('', '<details><summary>Test output (last 3000 characters)</summary>', '', '```', fence(quiet(tail)), '```', '</details>');
   }
-  lines.push('', `_A new push is reviewed again automatically. Checked ${new Date().toISOString()}._`);
+  const by = review.reviewer ? `Review by ${quiet(review.reviewer)}. ` : '';
+  lines.push('', `_${by}A new push is reviewed again automatically. Checked ${new Date().toISOString()}._`);
   return lines.join('\n');
 }
 
@@ -72,7 +74,7 @@ export class Dispatcher {
         this.skipped.add(key);
         continue;
       }
-      const meta = { branch: pr.branch, author: pr.author, title: pr.title, body: pr.body };
+      const meta = { branch: pr.branch, base: pr.base, author: pr.author, title: pr.title, body: pr.body };
       if (this.store.enqueue(pr.number, pr.sha, meta, this.now())) {
         queued++;
         this.log(`PR #${pr.number} ${pr.sha.slice(0, 12)} queued`);

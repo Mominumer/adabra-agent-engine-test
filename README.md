@@ -94,8 +94,9 @@ A reserved task refuses everyone else's claim (`reserved for member-b`); a close
 Watches open PRs and puts two commit statuses on every new head commit: `adabra/tests` and `adabra/review`. Make both
 required in branch protection and a failing or missing check blocks the merge; a new push is checked again.
 `adabra/tests` runs `npm test` on the exact commit inside a throwaway Docker container (no network, no host files, no
-secrets, not root, read-only system, 4 GB / 2 CPU / 512 processes / 15 min). `adabra/review` is still a placeholder
-that reports `error` until phase 3. See `REVIEW_WORKER_PLAN.md` in the plan folder.
+secrets, not root, read-only system, 4 GB / 2 CPU / 512 processes / 15 min). `adabra/review` is the mock review skill
+(`reviewer/review-mock.js`, reviewer `mock-v1`): it reads the PR's diff for that exact commit and fails on an added
+`debugger;` line or `MOCK-REVIEW: fail` in the PR description. The real Claude review will replace only this step. See `REVIEW_WORKER_PLAN.md` in the plan folder.
 
 ```bash
 umask 077; mkdir -p ~/.adabra; read -rs T; printf %s "$T" > ~/.adabra/review-token; unset T   # paste token, Enter

@@ -42,6 +42,7 @@ export class ReviewGitHub {
           number: p.number,
           sha: p.head.sha,
           branch: p.head.ref,
+          base: p.base?.ref ?? 'main',
           head_repo: p.head.repo?.full_name ?? null, // null when the fork was deleted
           author: p.user?.login ?? null,
           title: p.title,
@@ -85,6 +86,12 @@ export class ReviewGitHub {
       chunks.push(c);
     }
     return Buffer.concat(chunks);
+  }
+
+  // Files changed by exactly `sha` relative to where it branched from `base` (what the PR shows, pinned to this commit).
+  async compareFiles(base, sha) {
+    const r = await this.#req('GET', `/repos/${this.repo}/compare/${encodeURIComponent(base)}...${sha}?per_page=100`);
+    return { files: r.files ?? [], truncated: (r.files ?? []).length >= 300 };
   }
 
   async findReviewComment(pr) {

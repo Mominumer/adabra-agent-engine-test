@@ -22,7 +22,8 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { ReviewStore } from './store.js';
 import { ReviewGitHub } from './github.js';
-import { Dispatcher, notConfigured } from './dispatcher.js';
+import { Dispatcher } from './dispatcher.js';
+import { mockReview } from './review-mock.js';
 import { Sandbox, selfCheck } from './sandbox.js';
 
 const log = (m) => console.log(`${new Date().toISOString()} ${m}`);
@@ -46,6 +47,7 @@ function github() {
   return {
     openPulls: () => real.openPulls(), // reading is harmless
     downloadTarball: (sha) => real.downloadTarball(sha),
+    compareFiles: (base, sha) => real.compareFiles(base, sha),
     setStatus: async (sha, ctx, state, d) => log(`[dry-run] status ${sha.slice(0, 12)} ${ctx}=${state}: ${d}`),
     findReviewComment: async () => null,
     createComment: async (pr, body) => (log(`[dry-run] comment on PR #${pr}:\n${body}`), ++id),
@@ -60,7 +62,7 @@ function dispatcher() {
   return new Dispatcher({
     store, github: gh, repo: process.env.GITHUB_REPO, authors, log,
     runTests: sandbox.testRunner(gh),
-    runReview: notConfigured('review'), // phase 3: mock review skill
+    runReview: mockReview(gh), // later: the real Claude review skill, same contract
   });
 }
 
