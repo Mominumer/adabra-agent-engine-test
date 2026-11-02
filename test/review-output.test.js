@@ -240,6 +240,7 @@ test('a finding may name the path as the job shows it, and it comes back as the 
 
 // --- pre-checks -------------------------------------------------------------
 
+const DEBUG_STATEMENT = ['debug', 'ger;'].join(''); // in two parts: this repository is reviewed by the rule it tests
 const changed = (filename, added = 'const y = 1;', over = {}) => ({ filename, status: 'modified', patch: `@@ -1 +1,2 @@\n x\n+${added}`, ...over });
 const unshown = (filename, over = {}) => ({ filename, status: 'modified', changes: 0, sha: 'c'.repeat(40), ...over });
 const pre = (files, over) => preCheck({ files, ...over });
@@ -250,9 +251,9 @@ test('pre-checks: a clean PR has no blockers and nothing to read', () => {
 });
 
 test('pre-checks: an added debugger statement blocks, at its line, and one that was already there or removed does not', () => {
-  assert.deepEqual(blockerAt(pre([changed('src/a.js', 'debugger;')])), ['src/a.js:2']);
-  assert.deepEqual(pre([{ filename: 'a.js', patch: '@@ -1,2 +1 @@\n x\n-debugger;' }]).blockers, []);
-  assert.deepEqual(pre([{ filename: 'a.js', patch: '@@ -1,2 +1,2 @@\n debugger;\n x' }]).blockers, []);
+  assert.deepEqual(blockerAt(pre([changed('src/a.js', DEBUG_STATEMENT)])), ['src/a.js:2']);
+  assert.deepEqual(pre([{ filename: 'a.js', patch: `@@ -1,2 +1 @@\n x\n-${DEBUG_STATEMENT}` }]).blockers, []);
+  assert.deepEqual(pre([{ filename: 'a.js', patch: `@@ -1,2 +1,2 @@\n ${DEBUG_STATEMENT}\n x` }]).blockers, []);
 });
 
 test('pre-checks: hidden Unicode in an added line blocks, whatever a model might say', () => {

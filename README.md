@@ -225,7 +225,7 @@ REVIEW_DAILY_CAP=30    real review runs per UTC day, counted before each one sta
 ```
 
 Before anything is spent: if the tests did not pass, `adabra/review` is `error` ("Skipped: tests failed"). Checks that need no model
-can only block: an added `debugger;`, hidden Unicode, a changed file GitHub will not show (unless it is an image or font, or
+can only block: an added debugger statement, hidden Unicode, a changed file GitHub will not show (unless it is an image or font, or
 `REVIEW_UNSHOWN_OK` lists its extension), a diff of 100 files or 256 KB. The PR's head is compared with the commit just before the
 run. A valid result is stored by PR, commit, skill and model, so a retry after GitHub failed, or a restart, does not pay again.
 

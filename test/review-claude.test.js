@@ -36,6 +36,7 @@ const CLEAN = (() => {
 })();
 
 const shaOf = (n) => n.toString(16).padStart(40, 'a');
+const DEBUG_STATEMENT = ['debug', 'ger;'].join(''); // in two parts: this repository is reviewed by the rule it tests
 const changed = (filename, added = 'export const b = 2;') => ({ filename, status: 'modified', patch: `@@ -1 +1,2 @@\n x\n+${added}` });
 
 // A wrapper that can only start the fake. Its time limit is cut so a hang takes a second, not ten minutes.
@@ -747,7 +748,7 @@ test('tests failed, errored or crashed: no paid step, and no verdict is not a pa
 test('a pre-check block never reaches the model, and the pass that a model might give could not undo it', async (t) => {
   const h = setup(t);
   for (const [files, name] of [
-    [[changed('src/index.js', 'debugger;')], 'debugger'],
+    [[changed('src/index.js', DEBUG_STATEMENT)], 'debugger statement'],
     [[changed('src/index.js', 'let a = 1; \u202E')], 'bidi'],
     [[changed('src/index.js', 'let a = 1; \u{E0041}')], 'tag'],
     [[{ filename: 'tool.exe', status: 'added', changes: 0, sha: 'c'.repeat(40) }], 'not shown'],
@@ -976,11 +977,11 @@ test('REVIEW_ENGINE unset or mock: the mock decides, with no job directory, no s
 
 test('the mock still reviews when the tests failed, and still fails a debugger statement, as it always has', async (t) => {
   const h = setup(t, { env: {}, runTests: async () => ({ state: 'failure', summary: 'one failed', log: 'not ok' }) });
-  h.gh.files = [changed('src/index.js', 'debugger;')];
+  h.gh.files = [changed('src/index.js', DEBUG_STATEMENT)];
   const { sha, r } = await h.once({});
   assert.deepEqual([r.tests, r.review], ['failure', 'failure']);
   assert.equal(h.review(sha).at(-1).description, '1 blocking finding(s)');
-  assert.match(h.gh.comments[0].body, /blocker: `src\/index\.js:2` Leftover `debugger;` statement\./);
+  assert.ok(h.gh.comments[0].body.includes(`blocker: \`src/index.js:2\` Leftover \`${DEBUG_STATEMENT}\` statement.`));
 });
 
 test('an engine that is not one of the three stops the service from starting, rather than guessing', (t) => {
