@@ -14,3 +14,12 @@ export const plain = (s) =>
 
 // Safe inside a Markdown code span. Nothing but a backtick or a newline can end one.
 export const codeSpan = (s) => `\`${quiet(plain(s)).replace(/`/g, "'")}\``;
+
+// Text an operator typed (a stop reason, an override reason). Trusted author, but it is treated as plain text everywhere: one
+// line, no controls, nothing that notifies anyone or does anything in Markdown or HTML if it ever reaches a public comment.
+// Safe to apply twice.
+export const operatorText = (s, max = 200) =>
+  quiet(plain(s ?? '').replace(/\u{200B}/gu, ''))
+    .replace(/[`<>|[\]]/g, "'")
+    .slice(0, max)
+    .toWellFormed();

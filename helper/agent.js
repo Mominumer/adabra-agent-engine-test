@@ -36,12 +36,13 @@ for (const sig of stopSignals()) process.on(sig, () => ac.abort());
 // Under helper/supervisor.js (Windows): if the supervisor dies, stop too, so the next start cannot run a second agent.
 if (process.env.TEAM_AGENT_SUPERVISED) watchParent(() => ac.abort());
 
+const memory = {}; // lasts between passes: see tick
 log(`agent started, home ${home}, every ${tickMs / 1000}s`);
 while (!ac.signal.aborted) {
   try {
     const cfg = loadConfig(); // re-read each pass so enroll and token rotation take effect without a restart
-    const r = await tick({ claims, outbox, cfg, log, notify });
-    const status = { at: new Date().toISOString(), held: Object.keys(claims.all()), outbox: outbox.counts(), last: r };
+    const r = await tick({ claims, outbox, cfg, log, notify, memory });
+    const status = { at: new Date().toISOString(), held: Object.keys(claims.all()), outbox: outbox.counts(), last: r, stop: r.stop };
     writeFileSync(`${statusPath}.tmp`, JSON.stringify(status, null, 2));
     replaceFile(`${statusPath}.tmp`, statusPath);
     if (r.lost.length || r.sent.acked || r.sent.rejected) log(JSON.stringify({ lost: r.lost, sent: r.sent }));

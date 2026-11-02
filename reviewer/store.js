@@ -158,6 +158,11 @@ export class ReviewStore {
     return this.db.prepare("UPDATE jobs SET state = 'queued' WHERE state = 'running'").run().changes;
   }
 
+  // Back to the queue because of the operator's stop, not because anything failed: this run does not count against the job.
+  parkJob(pr, sha) {
+    this.db.prepare("UPDATE jobs SET state = 'queued', attempts = MAX(attempts - 1, 0) WHERE pr = ? AND sha = ?").run(pr, sha);
+  }
+
   getJob(pr, sha) {
     const row = this.db.prepare('SELECT * FROM jobs WHERE pr = ? AND sha = ?').get(pr, sha);
     return row ? { ...row, meta: JSON.parse(row.meta), result: row.result && JSON.parse(row.result) } : null;

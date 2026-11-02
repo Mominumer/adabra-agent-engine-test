@@ -1,6 +1,7 @@
 import http from 'node:http';
 import { validateEvent } from '../shared/event.js';
 import { validateReviewResult } from '../shared/review-result.js';
+import { RUNNING, stopBrief } from '../shared/stop.js';
 
 const MAX_BODY = 16 * 1024;
 export const DEFAULT_LEASE_MS = 180_000; // claim expires after 3 min without renewal
@@ -30,7 +31,8 @@ function readBody(req) {
 const TASK_RE = /^[A-Z][A-Z0-9]*-\d{1,9}$/;
 const RUN_RE = /^[A-Za-z0-9_-]{1,64}$/;
 
-export function createServer({ store, log = () => {}, now = () => Date.now(), leaseMs = DEFAULT_LEASE_MS }) {
+// stopState: the operator's emergency stop, read on every request so it takes effect at once; main.js passes the real one.
+export function createServer({ store, log = () => {}, now = () => Date.now(), leaseMs = DEFAULT_LEASE_MS, stopState = () => RUNNING }) {
   // Parses and validates a claim request body; sends the error response itself and returns null if invalid.
   async function claimBody(req, res, { needGeneration }) {
     let b;
@@ -63,19 +65,30 @@ export function createServer({ store, log = () => {}, now = () => Date.now(), le
     return send(res, 403, { error: `this needs a ${needed} device` });
   };
 
+  // While stopped, what would change something is refused, with a 503: older helpers and reviewers already treat that as
+  // "keep it and try again later", so a stop never looks to them like a lost claim or a rejected checkpoint.
+  const refuseIfStopped = (res, deviceId, what, extra = () => ({})) => {
+    const s = stopState();
+    if (!s.stopped) return false;
+    log(`${what} by ${String(deviceId).slice(0, 40)} refused: stopped by the operator`);
+    send(res, 503, { error: 'stopped', ...stopBrief(s), ...extra() });
+    return true;
+  };
+
   return http.createServer(async (req, res) => {
     try {
-      if (req.method === 'GET' && req.url === '/healthz') return send(res, 200, { ok: true });
+      if (req.method === 'GET' && req.url === '/healthz') return send(res, 200, stopState().stopped ? { ok: true, stopped: true } : { ok: true });
 
-      if (req.method === 'GET' && req.url === '/v1/tasks/mine') {
+      if (req.method === 'GET' && (req.url === '/v1/tasks/mine' || req.url === '/v1/stop')) {
         const deviceId = req.headers['x-device-id'];
         const auth = req.headers.authorization ?? '';
         if (!store.authenticate(deviceId, auth.startsWith('Bearer ') ? auth.slice(7) : '')) {
           log(`401 device=${String(deviceId).slice(0, 40)}`);
           return send(res, 401, { error: 'unauthorized' });
         }
+        if (req.url === '/v1/stop') return send(res, 200, stopBrief(stopState()));
         if (store.deviceRole(deviceId) !== 'builder') return refuseRole(res, deviceId, 'builder');
-        return send(res, 200, { tasks: store.tasksFor(deviceId, now()) });
+        return send(res, 200, { tasks: store.tasksFor(deviceId, now()), stop: stopBrief(stopState()) });
       }
 
       if (req.method === 'POST' && req.url.startsWith('/v1/')) {
@@ -92,6 +105,7 @@ export function createServer({ store, log = () => {}, now = () => Date.now(), le
         const role = store.deviceRole(deviceId);
         if (req.url === '/v1/review-results') {
           if (role !== 'reviewer') return refuseRole(res, deviceId, 'reviewer');
+          if (refuseIfStopped(res, deviceId, 'review result')) return;
           let result;
           try {
             result = JSON.parse(await readBody(req));
@@ -110,6 +124,7 @@ export function createServer({ store, log = () => {}, now = () => Date.now(), le
         if (role !== 'builder') return refuseRole(res, deviceId, 'builder');
 
         if (req.url === '/v1/claims') {
+          if (refuseIfStopped(res, deviceId, 'claim')) return;
           const b = await claimBody(req, res, { needGeneration: false });
           if (!b) return;
           const r = store.claimTask(b.task_id, deviceId, b.run_id, now(), leaseMs);
@@ -119,6 +134,12 @@ export function createServer({ store, log = () => {}, now = () => Date.now(), le
         if (req.url === '/v1/claims/renew') {
           const b = await claimBody(req, res, { needGeneration: true });
           if (!b) return;
+          // The lease is being kept alive by the coordinator (stop-keeper.js), so its owner is told how long it has.
+          const leaseIfOwner = () => {
+            const c = store.currentClaim(b.task_id);
+            return c?.state === 'held' && c.device_id === deviceId && c.run_id === b.run_id && c.generation === b.generation ? { expires_at: c.expires_at } : {};
+          };
+          if (refuseIfStopped(res, deviceId, `renew ${b.task_id}`, leaseIfOwner)) return;
           const r = store.renewClaim(b.task_id, deviceId, b.run_id, b.generation, now(), leaseMs);
           if (!r.ok) log(`renew ${b.task_id} by ${deviceId} refused: ${r.reason}`);
           return claimResponse(res, r, { lease_ms: leaseMs });
@@ -132,6 +153,7 @@ export function createServer({ store, log = () => {}, now = () => Date.now(), le
         }
 
         if (req.url === '/v1/events') {
+          if (refuseIfStopped(res, deviceId, 'checkpoint')) return; // it stays in the helper's outbox and is delivered after resume
           let event;
           try {
             event = JSON.parse(await readBody(req));

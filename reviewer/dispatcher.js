@@ -50,8 +50,9 @@ export function renderComment(job, tests, review) {
 
 export class Dispatcher {
   // linkTasks: queue a result for the coordinator when a job belongs to a task. Off when this reviewer has no device identity.
-  constructor({ store, github, repo, authors, runTests, runReview, now = () => Date.now(), log = () => {}, linkTasks = false }) {
-    Object.assign(this, { store, github, repo, runTests, runReview, now, log, linkTasks });
+  // isStopped: the operator's emergency stop. While it is true nothing starts and GitHub is not written to.
+  constructor({ store, github, repo, authors, runTests, runReview, now = () => Date.now(), log = () => {}, linkTasks = false, isStopped = () => false }) {
+    Object.assign(this, { store, github, repo, runTests, runReview, now, log, linkTasks, isStopped });
     this.authors = new Set(authors);
     this.skipped = new Set(); // log each skipped PR commit once, not every poll
   }
@@ -65,6 +66,7 @@ export class Dispatcher {
 
   // Queue every new head commit of eligible open PRs and mark it pending on GitHub.
   async poll() {
+    if (this.isStopped()) return 0; // a push made meanwhile is still the head commit at the first poll after resume
     let queued = 0;
     for (const pr of await this.github.openPulls()) {
       const why = this.eligible(pr);
@@ -86,18 +88,50 @@ export class Dispatcher {
 
   // Run the oldest due job. Returns the job's outcome, or null when there is nothing to do.
   async runOnce() {
+    if (this.isStopped()) return null;
     const job = this.store.next(this.now());
     if (!job) return null;
+    this.running = true;
+    this.interrupted = false;
+    try {
+      return await this.#run(job);
+    } finally {
+      this.running = false;
+    }
+  }
+
+  // A stop has taken effect. True while a job is running: the caller ends its containers, and what comes back is not posted.
+  interrupt() {
+    if (!this.running) return false;
+    this.interrupted = true;
+    return true;
+  }
+
+  // Sticky for the job: a resume a moment later does not make a killed run's result worth posting.
+  #halted() {
+    if (this.isStopped()) this.interrupted = true;
+    return this.interrupted;
+  }
+
+  async #run(job) {
     this.store.markRunning(job.pr, job.sha);
     this.log(`PR #${job.pr} ${job.sha.slice(0, 12)} running`);
-    let tests, review;
+    let tests, review, crash;
     try {
       tests = normalize(await this.runTests(job), 'test');
-      review = normalize(await this.runReview(job), 'review');
+      if (!this.#halted()) review = normalize(await this.runReview(job), 'review');
     } catch (err) {
-      // The machinery failed (e.g. Docker down), not the PR: say so on GitHub and try again later.
-      return this.#retry(job, `runner: ${err.message}`, 'Review infrastructure problem; retrying');
+      crash = err;
     }
+    // Checked once, before the first post: a stop either keeps the whole result off GitHub or lets all of it finish. What a stopped
+    // run returned says nothing about the PR (a killed container looks like a failure), so the job goes back to the queue, unposted.
+    if (this.#halted()) {
+      this.store.parkJob(job.pr, job.sha);
+      this.log(`PR #${job.pr} ${job.sha.slice(0, 12)} back in the queue: stopped by the operator`);
+      return { pr: job.pr, sha: job.sha, parked: true };
+    }
+    // The machinery failed (e.g. Docker down), not the PR: say so on GitHub and try again later.
+    if (crash) return this.#retry(job, `runner: ${crash.message}`, 'Review infrastructure problem; retrying');
     try {
       await this.github.setStatus(job.sha, CONTEXTS.tests, tests.state, tests.summary || tests.state);
       await this.github.setStatus(job.sha, CONTEXTS.review, review.state, review.summary || review.state);
