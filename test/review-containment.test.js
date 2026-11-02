@@ -7,7 +7,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { gzipSync } from 'node:zlib';
 import { Sandbox } from '../reviewer/sandbox.js';
-import { buildJobDir, JOB_ID_RE, jobId, removeJobDir, sweepJobDirs, unpackCleanTar, walk } from '../reviewer/job-dir.js';
+import { buildJobDir, JOB_ID_RE, jobId, PAID_MARK, removeJobDir, sweepJobDirs, unpackCleanTar, walk } from '../reviewer/job-dir.js';
 import { HOSTILE_KEPT, hostileTarball, isSafeTreePath, paxPathEntry, rawTarball, rawTarEntry, readCleanTar } from '../reviewer/tar.js';
 import { expectedProbes, judgeProbes, parseProbes, reviewCheck } from '../reviewer/review-check.js';
 
@@ -427,7 +427,7 @@ test('exec without stdoutLimit is unchanged: output goes to the log and there is
 // --- the wrapper ----------------------------------------------------------
 
 // A copy of the real wrapper pointed at a temp folder, with this test's user as the review user.
-function installWrapper(t, { reviewUser = userInfo().username, withCredential = false } = {}) {
+function installWrapper(t, { reviewUser = userInfo().username, withCredential = false, modelEnabled = false } = {}) {
   const dir = tempDir(t);
   const home = join(dir, 'review-home');
   const dispatcherHome = join(dir, 'dispatcher-home');
@@ -437,28 +437,173 @@ function installWrapper(t, { reviewUser = userInfo().username, withCredential = 
   const text = readFileSync(join(USER_DIR, 'run-review'), 'utf8').replaceAll('/opt/adabra-review', dir);
   writeFileSync(join(dir, 'bin', 'run-review'), text);
   chmodSync(join(dir, 'bin', 'run-review'), 0o755);
-  writeFileSync(join(dir, 'bin', 'claude'), '#!/bin/sh\necho MODEL-WAS-CALLED\n');
+  // Leaves a mark, so a test can tell it ran even when its output went nowhere.
+  writeFileSync(join(dir, 'bin', 'claude'), `#!/bin/sh\necho called >> ${JSON.stringify(join(dir, 'claude-called'))}\necho MODEL-WAS-CALLED\nexit "\${FAKE_EXIT:-0}"\n`);
   chmodSync(join(dir, 'bin', 'claude'), 0o755);
   writeFileSync(join(dir, 'etc', 'paths.sh'), `REVIEW_USER=${reviewUser}\nREVIEW_HOME=${home}\nDISPATCHER_HOME=${dispatcherHome}\nSERVICE_DIR=${dispatcherHome}/code\n`);
   writeFileSync(join(dir, 'etc', 'settings.json'), readFileSync(join(USER_DIR, 'settings.json')));
   writeFileSync(join(dir, 'etc', 'review-schema.json'), readFileSync(join(USER_DIR, 'review-schema.json')));
   writeFileSync(join(dir, 'skill', 'review-v1.md'), readFileSync(join(USER_DIR, 'review-v1.md')));
   if (withCredential) writeFileSync(join(home, '.review-credential'), 'SECRET-CREDENTIAL-TEXT');
+  if (modelEnabled) writeFileSync(join(dir, 'etc', 'model-enabled'), '');
   return { dir, home, dispatcherHome, env: { ...process.env, LEAK_ME: 'caller-secret', CLAUDE_CODE_OAUTH_TOKEN: 'caller-token' } };
 }
 
 function wrapper(dir, env, args) {
-  const r = spawnSync(join(dir, 'bin', 'run-review'), args, { env, encoding: 'utf8', cwd: dir });
+  const r = spawnSync(join(dir, 'bin', 'run-review'), args, { env, encoding: 'utf8', cwd: dir, timeout: 20_000 });
   return { status: r.status, stdout: r.stdout, stderr: r.stderr };
 }
 
-test('wrapper: the shipped file cannot call a model or load the credential', () => {
+// Reading the shipped file: the model and the credential appear only inside one function, and one line calls it, after both gates.
+test('wrapper: the model step sits behind both gates, and nothing else can call a model or load the credential', () => {
   const text = readFileSync(join(USER_DIR, 'run-review'), 'utf8');
   const code = text.split('\n').filter((l) => !l.trim().startsWith('#')).join('\n');
-  assert.ok(!/bin\/claude["\s]*-p|claude\s+-p/.test(code), 'no model invocation');
-  assert.ok(!/cat[^\n]*review-credential|<[^\n]*review-credential/.test(code), 'never opens the credential');
-  assert.ok(!/OAUTH_TOKEN|ANTHROPIC_API_KEY/.test(code), 'never sets a credential variable');
+  const start = code.indexOf('model_step() {');
+  const body = code.slice(start, code.indexOf('\n}\n', start));
+  const rest = code.replace(body, '');
+  assert.match(body, /"\$OPT\/bin\/claude" -p/);
+  assert.ok(!/bin\/claude["\s]*-p|claude\s+-p/.test(rest), 'no model invocation anywhere else');
+  assert.ok(!/cat[^\n]*review-credential|<[^\n]*review-credential/.test(rest), 'never opens the credential anywhere else');
+  assert.ok(!/OAUTH_TOKEN|ANTHROPIC_API_KEY/.test(rest), 'never sets a credential variable anywhere else');
+  assert.match(code, /job "\$1"\n\s*\[ -f "\$OPT\/etc\/model-enabled" \] \|\| refuse [^\n]* 78\n\s*\[ -f "\$JOB\/paid-run" \] \|\| refuse [^\n]* 79\n\s*model_step "\$1"\n/);
+  assert.equal(code.match(/^\s*model_step( "\$1"|\(\) \{)$/gm).length, 2, 'defined once, called once');
+  assert.match(body, /IFS= read -r CLAUDE_CODE_OAUTH_TOKEN <"\$REVIEW_HOME\/\.review-credential"/, 'read with a built-in');
+  assert.ok(!/env [^\n]*OAUTH_TOKEN=|OAUTH_TOKEN=\$\(/.test(body), 'never through an argument or another process');
+  assert.ok(!/--bare|--fallback-model|--dangerously|bypassPermissions/.test(code));
+  assert.ok(text.includes(PAID_MARK), 'the wrapper and the dispatcher name the same mark');
   assert.ok(lstatSync(join(USER_DIR, 'run-review')).mode & 0o100, 'executable in the repository');
+});
+
+// A credential that hangs anything trying to read it, so "never opened" is seen and not assumed.
+function hangingCredential(home) {
+  execFileSync('mkfifo', [join(home, '.review-credential')]);
+}
+
+const markedJob = (dir, id, { mark = true } = {}) => {
+  mkdirSync(join(dir, 'in', id), { recursive: true });
+  if (mark) writeFileSync(join(dir, 'in', id, PAID_MARK), '');
+};
+
+test('wrapper: with the model step off, a job exits 78 even with the paid mark, and the credential is never opened', (t) => {
+  const { dir, env, home } = installWrapper(t);
+  hangingCredential(home);
+  const id = `7-${SHA}-1700000000000`;
+  markedJob(dir, id);
+  const r = wrapper(dir, env, [id]);
+  assert.equal(r.status, 78);
+  assert.equal(r.stdout, '');
+  assert.match(r.stderr, /model step is not installed/);
+  assert.ok(!existsSync(join(dir, 'claude-called')));
+});
+
+test('wrapper: with the model step on, a job without the paid mark exits 79 and the credential is never opened', (t) => {
+  const { dir, env, home } = installWrapper(t, { modelEnabled: true });
+  hangingCredential(home);
+  const id = `7-${SHA}-1700000000000`;
+  markedJob(dir, id, { mark: false });
+  const r = wrapper(dir, env, [id]);
+  assert.equal(r.status, 79);
+  assert.equal(r.stdout, '');
+  assert.ok(!existsSync(join(dir, 'claude-called')));
+});
+
+test('wrapper: a PR cannot supply the paid mark: its files are under tree/, and only a mark beside tree/ counts', (t) => {
+  const { dir, env } = installWrapper(t, { modelEnabled: true, withCredential: true });
+  const { tar, report } = cleanWith(rawTarball([file(PAID_MARK), file(`sub/${PAID_MARK}`), file('ok.txt')]));
+  const job = buildJobDir({ root: join(dir, 'in'), pr: 7, sha: SHA, tar, report, now: 1700000000000 });
+  assert.ok(existsSync(join(job.dir, 'tree', PAID_MARK)));
+  assert.equal(wrapper(dir, env, [job.id]).status, 79);
+  assert.ok(!existsSync(join(dir, 'claude-called')));
+});
+
+test('job directory: only a job built for a paid run holds the mark, with the usual modes', (t) => {
+  const root = tempDir(t);
+  const { tar, report } = cleanWith(rawTarball([file('ok.txt')]));
+  const plain = buildJobDir({ root, pr: 1, sha: SHA, tar, report, now: 1700000000000 });
+  assert.ok(!existsSync(join(plain.dir, PAID_MARK)), 'off by default');
+  const paid = buildJobDir({ root, pr: 2, sha: SHA, tar, report, now: 1700000000000, paid: true });
+  assert.equal(lstatSync(join(paid.dir, PAID_MARK)).mode & 0o777, 0o640);
+  assert.deepEqual(readdirSync(paid.dir).sort(), ['diff.patch', 'manifest.json', PAID_MARK, 'pr.json', 'tree'].sort());
+});
+
+test('wrapper: on and marked, it starts the CLI in the job directory and hands back what the CLI said', (t) => {
+  const { dir, env, home } = installWrapper(t, { modelEnabled: true, withCredential: true });
+  const id = `7-${SHA}-1700000000000`;
+  markedJob(dir, id);
+  const r = wrapper(dir, env, [id]);
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(r.stdout, 'MODEL-WAS-CALLED\n');
+  assert.equal(readFileSync(join(dir, 'claude-called'), 'utf8'), 'called\n');
+  assert.deepEqual(readdirSync(home).filter((n) => n.startsWith('.claude-run')), [], 'no config directory left behind');
+  assert.ok(!r.stderr.includes('SECRET-CREDENTIAL-TEXT'));
+});
+
+test('wrapper: the CLI\'s exit code comes back unchanged', (t) => {
+  const { dir, env } = installWrapper(t, { modelEnabled: true, withCredential: true });
+  writeFileSync(join(dir, 'bin', 'claude'), '#!/bin/sh\necho partial\nexit 42\n');
+  const id = `7-${SHA}-1700000000000`;
+  markedJob(dir, id);
+  const r = wrapper(dir, env, [id]);
+  assert.equal(r.status, 42);
+  assert.equal(r.stdout, 'partial\n');
+});
+
+test('wrapper: the time limit is enforced around the CLI', (t) => {
+  const { dir, env } = installWrapper(t, { modelEnabled: true, withCredential: true });
+  const text = readFileSync(join(dir, 'bin', 'run-review'), 'utf8');
+  assert.ok(text.includes('/usr/bin/timeout -k 30 600 '), 'the shipped limit: ten minutes, then killed 30 seconds later');
+  writeFileSync(join(dir, 'bin', 'run-review'), text.replace('-k 30 600', '-k 1 1'));
+  writeFileSync(join(dir, 'bin', 'claude'), '#!/bin/sh\nexec sleep 30\n');
+  const id = `7-${SHA}-1700000000000`;
+  markedJob(dir, id);
+  assert.equal(wrapper(dir, env, [id]).status, 124);
+});
+
+test('wrapper: no credential, or an empty one, exits 77 without starting the CLI', (t) => {
+  const none = installWrapper(t, { modelEnabled: true });
+  const id = `7-${SHA}-1700000000000`;
+  markedJob(none.dir, id);
+  assert.equal(wrapper(none.dir, none.env, [id]).status, 77);
+  assert.ok(!existsSync(join(none.dir, 'claude-called')));
+  assert.deepEqual(readdirSync(none.home).filter((n) => n.startsWith('.claude-run')), []);
+
+  const empty = installWrapper(t, { modelEnabled: true });
+  writeFileSync(join(empty.home, '.review-credential'), '');
+  markedJob(empty.dir, id);
+  assert.equal(wrapper(empty.dir, empty.env, [id]).status, 77);
+  assert.ok(!existsSync(join(empty.dir, 'claude-called')));
+});
+
+test('wrapper: with the model step on, bad ids and links are still refused before anything starts', (t) => {
+  const { dir, env, home } = installWrapper(t, { modelEnabled: true, withCredential: true });
+  for (const id of ['', '../../etc', '$(id)', `7-${SHA}-170`, `9-${SHA}-1700000000000`]) {
+    assert.equal(wrapper(dir, env, [id]).status, 64, JSON.stringify(id));
+  }
+  const asLink = `7-${SHA}-1700000000000`;
+  writeFileSync(join(home, PAID_MARK), '');
+  symlinkSync(home, join(dir, 'in', asLink));
+  assert.equal(wrapper(dir, env, [asLink]).status, 64);
+  const holding = `8-${SHA}-1700000000000`;
+  markedJob(dir, holding);
+  symlinkSync(join(home, '.review-credential'), join(dir, 'in', holding, 'innocent'));
+  assert.equal(wrapper(dir, env, [holding]).status, 64);
+  assert.ok(!existsSync(join(dir, 'claude-called')));
+});
+
+test('wrapper: a stale config directory from a killed run is cleared, and each run gets a new one', (t) => {
+  const { dir, env, home } = installWrapper(t, { modelEnabled: true, withCredential: true });
+  mkdirSync(join(home, '.claude-run.stale'));
+  const id = `7-${SHA}-1700000000000`;
+  markedJob(dir, id);
+  assert.equal(wrapper(dir, env, [id]).status, 0);
+  assert.ok(!existsSync(join(home, '.claude-run.stale')));
+});
+
+test('wrapper: the check reports the model step, for review-check to compare', (t) => {
+  const off = installWrapper(t);
+  assert.equal(parseProbes(wrapper(off.dir, off.env, ['check']).stdout).model_step, 'off');
+  const on = installWrapper(t, { modelEnabled: true });
+  assert.equal(parseProbes(wrapper(on.dir, on.env, ['check']).stdout).model_step, 'on');
 });
 
 test('wrapper: exits 78 with no output for a valid job, and never starts the CLI', (t) => {
@@ -641,6 +786,13 @@ const localSandbox = { cleanTree: async ({ tarball }) => {
   return { tar: r.tar, report: r.report };
 } };
 
+const optDirs = [];
+const writeSwitch = (i) => {
+  const path = join(i.dir, 'etc', 'model-enabled');
+  writeFileSync(path, '');
+  return path;
+};
+
 function runCheck(t, over = {}, prepare = () => {}) {
   const installed = installWrapper(t, { withCredential: true });
   chmodSync(join(installed.dir, 'in'), 0o750);
@@ -683,6 +835,61 @@ test('review-check, end to end with the real wrapper: refuses to pass when the r
   // Leaves nothing behind, even though it failed.
   assert.deepEqual(readdirSync(join(installed.dir, 'in')), []);
   assert.ok(!existsSync(join(installed.dispatcherHome, '.adabra-review-canary')));
+});
+
+test('review-check never reaches the model: with the step on, and with it off', async (t) => {
+  for (const on of [false, true]) {
+    const { installed, promise } = runCheck(t, {}, (i) => {
+      if (on) writeFileSync(join(i.dir, 'etc', 'model-enabled'), '');
+    });
+    const r = await promise;
+    const get = (check) => r.results.find((x) => x.check === check);
+    assert.ok(!existsSync(join(installed.dir, 'claude-called')), `the CLI never started, with the step ${on ? 'on' : 'off'}`);
+    assert.equal(get('wrapper.no_model_output').ok, true);
+    assert.equal(get('wrapper.model_step').got, on ? 'on' : 'off');
+    assert.equal(get('wrapper.model_step').ok, true);
+    if (on) {
+      assert.equal(get('wrapper.unmarked_job_refused').got, 'exit 79');
+      assert.equal(get('wrapper.unmarked_job_refused').ok, true);
+      assert.equal(get('wrapper.no_model_step'), undefined);
+      assert.equal(get('owner.etc/model-enabled').ok, true, 'and the switch itself must be root-only');
+    } else {
+      assert.equal(get('wrapper.no_model_step').got, 'exit 78');
+      assert.equal(get('owner.etc/model-enabled'), undefined, 'not required when off');
+    }
+    for (const id of ['traversal', 'empty', 'command', 'short', 'newline', 'unknown']) assert.equal(get(`wrapper.id.${id}`).ok, true, id);
+    assert.equal(get('wrapper.job_is_link').ok, true);
+    assert.equal(get('wrapper.job_holds_link').ok, true);
+  }
+});
+
+test('review-check: the step being switched on while it runs gives a failed check and still no spend', async (t) => {
+  const { installed, promise } = runCheck(t, {
+    sandbox: { cleanTree: async (args) => {
+      writeFileSync(join(optDirs.at(-1), 'etc', 'model-enabled'), '');
+      return localSandbox.cleanTree(args);
+    } },
+  }, (i) => optDirs.push(i.dir));
+  const r = await promise;
+  assert.equal(r.results.find((x) => x.check === 'wrapper.no_model_step').got, 'exit 79');
+  assert.equal(r.results.find((x) => x.check === 'wrapper.no_model_step').ok, false);
+  assert.ok(!existsSync(join(installed.dir, 'claude-called')));
+});
+
+test('review-check: a tampered switch is caught, and a wrapper older than the switch counts as off', async (t) => {
+  const tampered = await runCheck(t, {}, (i) => chmodSync(writeSwitch(i), 0o666)).promise;
+  assert.equal(tampered.results.find((x) => x.check === 'owner.etc/model-enabled').got, 'writable by others');
+  const older = await runCheck(t, {}, (i) => {
+    const path = join(i.dir, 'bin', 'run-review');
+    writeFileSync(path, readFileSync(path, 'utf8').replace(/^.*say model_step.*$/m, ''));
+  }).promise;
+  assert.equal(older.results.find((x) => x.check === 'wrapper.model_step').ok, true);
+});
+
+test('review-check --live is refused until it exists: the plain check must stay the one that cannot spend', () => {
+  const r = spawnSync(process.execPath, [join(REPO, 'reviewer', 'main.js'), 'review-check', '--live'], { encoding: 'utf8', env: { PATH: process.env.PATH } });
+  assert.equal(r.status, 2);
+  assert.match(r.stderr, /never calls a model/);
 });
 
 test('review-check: a result never carries a file\'s contents', async (t) => {
@@ -746,6 +953,32 @@ test('installer: parses, and installs only what the design allows', () => {
   assert.ok(!/review-credential/.test(code), 'never touches the credential');
   assert.ok(!/\bkeychain\b|security /i.test(code));
   assert.ok(!/claude\s+-p/.test(code), 'no model call');
+});
+
+test('installer: the options it takes, and that enabling still needs sudo', () => {
+  if (process.getuid() === 0) return;
+  const run = (...args) => spawnSync(INSTALLER, args, { encoding: 'utf8', env: { PATH: process.env.PATH } });
+  const enable = run('install', '--enable-model');
+  assert.equal(enable.status, 1);
+  assert.match(enable.stderr, /run this with sudo/);
+  for (const args of [['install', '--enable'], ['install', '--enable-model', 'more'], ['uninstall', '--enable-model'], ['--enable-model']]) {
+    const r = run(...args);
+    assert.equal(r.status, 2, args.join(' '));
+    assert.match(r.stdout, /--enable-model/);
+  }
+});
+
+test('installer: the model step is off unless asked for by name, and a plain install turns it off', () => {
+  const code = readFileSync(INSTALLER, 'utf8').split('\n').filter((l) => !l.trim().startsWith('#')).join('\n');
+  const removed = code.indexOf('rm -f "$OPT/etc/model-enabled"');
+  const copied = code.indexOf('install -o root -g wheel -m 755 "$SRC/run-review"');
+  const started = code.indexOf('"$OPT/bin/run-review" check');
+  const created = code.indexOf(': > "$OPT/etc/model-enabled"');
+  assert.ok(removed > 0 && removed < copied, 'removed first, so an install that stops anywhere leaves it off');
+  assert.equal(code.match(/> "\$OPT\/etc\/model-enabled"/g).length, 1, 'one place creates it');
+  assert.ok(created > started, 'only after the install has proved itself');
+  assert.match(code, /if \[ "\$OPTION" = --enable-model \]; then\n\s*: > "\$OPT\/etc\/model-enabled"\n\s*chown root:wheel "\$OPT\/etc\/model-enabled"\n\s*chmod 644 "\$OPT\/etc\/model-enabled"\n/);
+  assert.match(code, /rm -rf "\$OPT\/in" "\$OPT\/etc" "\$OPT\/skill"/, 'uninstall takes it too');
 });
 
 test('settings, schema and skill: what the review step will be held to', () => {

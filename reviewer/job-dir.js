@@ -10,6 +10,7 @@ export const JOB_ID_RE = /^[1-9][0-9]{0,8}-[0-9a-f]{40}-[0-9]{10,16}$/;
 const BUILDING_RE = /^\.building-[1-9][0-9]{0,8}-[0-9a-f]{40}-[0-9]{10,16}$/;
 const DIR_MODE = 0o750;
 const FILE_MODE = 0o640;
+export const PAID_MARK = 'paid-run';
 
 export function jobId(pr, sha, now = Date.now()) {
   const id = `${pr}-${sha}-${now}`;
@@ -58,7 +59,9 @@ export function unpackCleanTar(tar, dest) {
 
 // Builds the job under a name the wrapper refuses, then renames it, so the review user can never see a half-written job.
 // Returns { id, dir, files }. `report` is the cleaning step's report of what it dropped.
-export function buildJobDir({ root = JOB_ROOT, pr, sha, tar, report, diff = '', title = '', body = '', task = null, now = Date.now() }) {
+// `paid` writes the mark the wrapper requires before it starts the model. Off by default, so a job built for any other reason cannot
+// spend. It sits beside tree/, which is the only place PR content goes, so a PR cannot plant it.
+export function buildJobDir({ root = JOB_ROOT, pr, sha, tar, report, diff = '', title = '', body = '', task = null, now = Date.now(), paid = false }) {
   const id = jobId(pr, sha, now);
   const building = join(root, `.building-${id}`);
   const dir = join(root, id);
@@ -74,6 +77,7 @@ export function buildJobDir({ root = JOB_ROOT, pr, sha, tar, report, diff = '', 
       dropped_total: report?.dropped_total ?? 0,
       dropped: report?.dropped ?? [],
     }, null, 2));
+    if (paid) writeNew(join(building, PAID_MARK), '');
     renameSync(building, dir);
     return { id, dir, files };
   } catch (err) {
