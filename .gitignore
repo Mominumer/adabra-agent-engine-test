@@ -6,3 +6,4 @@ token
 *token*
 .env
 .DS_Store
+.claude/settings.local.json
