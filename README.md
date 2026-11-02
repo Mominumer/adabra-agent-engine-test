@@ -249,6 +249,20 @@ While reviews are paused the tests still run and `adabra/tests` still posts its 
 restarts, except the one waiting for the operator, which a restart lifts. `node reviewer/main.js status` shows the pause and the
 day's count.
 
+**With an emergency stop.** The dispatcher looks at the stop at the last moment before each paid run, so none starts during a stop. A
+run that has already started cannot be ended from here, as it belongs to another user. It finishes, a valid result is stored and it
+counts towards the daily cap, nothing about it is posted, and the job goes back to the queue. After `resume` the job uses the stored
+result and pays nothing. A result that was not valid is not stored, so that one job pays again.
+
+**With a GitHub App outage.** An `authOutage` from the diff, the tarball, the head check or posting holds the job and retries every 30
+seconds. No run is started or counted because of it. A result already paid for is stored, so it is posted once GitHub answers again.
+
+A stop, a pause and an outage hold don't use attempts, and none of them changes another's state: a job waits for whichever applies.
+
+**`override` works whatever `REVIEW_ENGINE` is,** since that command never builds a review engine. It also works on a job that is
+waiting out a pause, because an outage blocking a merge is what it is for. It takes that job out of the queue so its result cannot replace
+the override, and `retry <pr>` brings it back. It still refuses a job that is running or about to run.
+
 ## Emergency stop and operator override (Mac mini)
 
 ```bash
@@ -276,7 +290,7 @@ Run `resume` with the coordinator up: a lease that ran out while the coordinator
 
 **Reasons are plain text.** One line, no controls, no working `@mentions`, no Markdown or HTML. An override's reason goes to the reviewer's log and never to GitHub; the status always reads `operator override`. A stop's reason goes to enrolled devices and never to GitHub.
 
-**Override** acts on the head commit it showed you, looked up again after you confirm. It refuses a closed or merged PR, and refuses while a review of that commit is queued or running, because the result would replace it. It never touches `adabra/tests`, so a PR whose tests failed stays blocked. A new push loses it, because statuses belong to a commit. It leaves a record in `~/Library/Logs/adabra-reviewer.log` (or `REVIEW_LOG_FILE`) before it posts: if it cannot write there, it does not post. It works during a stop, because it is a person's deliberate act and no job is involved.
+**Override** acts on the head commit it showed you, looked up again after you confirm. It refuses a closed or merged PR, and refuses while a review of that commit is queued or running, because the result would replace it (a real review waiting out a pause is the exception: see above). It never touches `adabra/tests`, so a PR whose tests failed stays blocked. A new push loses it, because statuses belong to a commit. It leaves a record in `~/Library/Logs/adabra-reviewer.log` (or `REVIEW_LOG_FILE`) before it posts: if it cannot write there, it does not post. It works during a stop, because it is a person's deliberate act and no job is involved.
 
 **Who may run what.** Agents may run `stop`, `status` and `check`: stopping is the safe direction. `resume` and `override` are for a person at the mini, like merging. Both need a terminal and a typed confirmation, and `.claude/settings.json` denies them. **That is a speed bump, not a boundary.** While builder sessions run as the same macOS user as the reviewer, an agent can fake a terminal, edit the state file or read the token or key. Deny rules only bind sessions that load this repo's settings. A hard boundary needs the planned separate builder user.
 ## GitHub App instead of personal tokens (Mac mini)

@@ -8,8 +8,10 @@ import { fileURLToPath } from 'node:url';
 import { CONTEXTS, Dispatcher, SHADOW_CONTEXT } from '../reviewer/dispatcher.js';
 import { MODEL, PRECHECK_REVIEWER, reviewEngine, SKILL, sudoRunner } from '../reviewer/review-claude.js';
 import { judgeRun, STATUS_TEXT } from '../reviewer/review-output.js';
-import { REVIEW_MARKER } from '../reviewer/github.js';
-import { nextUtcMidnight, ReviewStore } from '../reviewer/store.js';
+import { REVIEW_MARKER, ReviewGitHub } from '../reviewer/github.js';
+import { OVERRIDE_TEXT, runOverride } from '../reviewer/override.js';
+import { AUTH_HOLD_MS } from '../shared/github-auth.js';
+import { MAX_ATTEMPTS, nextUtcMidnight, ReviewStore } from '../reviewer/store.js';
 import { rawTarball, rawTarEntry } from '../reviewer/tar.js';
 import { validateReviewResult } from '../shared/review-result.js';
 
@@ -140,6 +142,7 @@ function setup(t, { env = { REVIEW_ENGINE: 'claude', REVIEW_DAILY_CAP: '100000' 
   const clock = { t: START };
   const logs = [];
   const testCalls = { n: 0 };
+  const stop = { on: false };
   const log = (m) => logs.push(m);
   const now = () => clock.t;
   const engine = reviewEngine({
@@ -147,12 +150,12 @@ function setup(t, { env = { REVIEW_ENGINE: 'claude', REVIEW_DAILY_CAP: '100000' 
     sandbox: sandbox ?? { cleanTree: async () => CLEAN },
   });
   const d = new Dispatcher({
-    store, github: gh, repo: 'o/r', authors: ['alice'], log, now, linkTasks, ...engine,
+    store, github: gh, repo: 'o/r', authors: ['alice'], log, now, linkTasks, isStopped: () => stop.on, ...engine,
     runTests: runTests ?? (async () => (testCalls.n++, { state: 'success', summary: 'npm test passed' })),
   });
   let nextPr = 1;
   const h = {
-    dir, stack, store, gh, clock, logs, d, testCalls,
+    dir, stack, store, gh, clock, logs, d, testCalls, stop,
     queue(meta = {}, pr = nextPr++, sha = shaOf(pr)) {
       store.enqueue(pr, sha, { branch: `feature/${pr}`, base: 'main', author: 'alice', title: 'Title', body: '', ...meta }, clock.t);
       gh.heads.set(pr, { sha, state: 'open' });
@@ -1039,4 +1042,546 @@ test('the real engine with a real sudo path is only ever reached through the ins
   assert.ok(!/bin\/claude/.test(text), 'the dispatcher never starts the CLI itself');
   assert.match(text, /sudo = '\/usr\/bin\/sudo'/);
   assert.match(text, /\['-n', '-u', reviewUser, join\(opt, 'bin', 'run-review'\), id\]/, 'one fixed command, never a password prompt');
+});
+
+// --- where the features meet: the emergency stop --------------------------
+
+// Stands the stop up at the one moment a run has been counted and is about to start: nothing can look at the stop after this.
+function stopOnceTheRunBegins(h, act = () => { h.stop.on = true; }) {
+  const begin = h.store.beginReviewRun.bind(h.store);
+  h.store.beginReviewRun = (args) => {
+    const id = begin(args);
+    act();
+    h.store.beginReviewRun = begin;
+    return id;
+  };
+}
+
+test('a stop during a paid run: the run is stored and counted, nothing is half-posted, the job goes back, and resume pays nothing', async (t) => {
+  const h = setup(t, { linkTasks: true });
+  const sha = shaOf(1);
+  stopOnceTheRunBegins(h);
+  const { pr, r } = await h.once({ output: goodOutput(sha, { verdict: 'fail', findings: [finding({ severity: 'blocker', message: 'the stored finding' })] }) }, { branch: 'task/TASK-1' });
+
+  assert.deepEqual(r, { pr, sha, parked: true });
+  assert.equal(h.calls().length, 1, 'it had started, and could not be ended from here');
+  assert.deepEqual(h.gh.statuses, [], 'no status at all: not the tests\', not the review\'s');
+  assert.deepEqual(h.gh.comments, []);
+  assert.deepEqual(h.store.taskResultCounts(), {});
+  const parked = h.store.getJob(pr, sha);
+  assert.deepEqual([parked.state, parked.attempts], ['queued', 0], 'back in the queue, with no attempt used');
+  assert.equal(h.store.paidRunsOn(START), 1, 'it was paid for, so it counts');
+  const [run] = h.store.reviewRuns(pr, sha);
+  assert.deepEqual([run.outcome, run.paid], ['valid', 1]);
+  assert.deepEqual(h.jobDirs(), [], 'and the PR\'s text is gone from disk');
+  assert.equal(await h.d.runOnce(), null, 'nothing starts while stopped');
+
+  h.stop.on = false;
+  h.control({ stdout: 'a second run would read this', exit: 1 });
+  const after = await h.d.runOnce();
+  assert.deepEqual(after, { pr, sha, tests: 'success', review: 'failure' });
+  assert.equal(h.calls().length, 1, 'no second run');
+  assert.equal(h.store.reviewRuns(pr, sha).length, 1);
+  assert.equal(h.store.paidRunsOn(START), 1);
+  assert.equal(h.gh.statuses.length, 2, 'both statuses, once each');
+  assert.equal(h.review(sha)[0].description, '1 blocking finding(s)');
+  assert.match(h.gh.comments[0].body, /the stored finding/);
+  assert.equal(h.store.getJob(pr, sha).state, 'done');
+  assert.deepEqual(h.store.taskResultCounts(), { pending: 1 }, 'and the task hears once');
+});
+
+test('a stop lifted before the paid run comes back still posts nothing about that run, and the result is used afterwards', async (t) => {
+  const h = setup(t);
+  stopOnceTheRunBegins(h, () => h.d.interrupt()); // what the stop's watcher does; by the time the run returns the stop has been lifted
+  const { pr, sha, r } = await h.once({});
+  assert.equal(r.parked, true);
+  assert.deepEqual(h.gh.statuses, []);
+  assert.equal((await h.d.runOnce()).review, 'success');
+  assert.equal(h.calls().length, 1);
+  assert.equal(h.store.getJob(pr, sha).attempts, 1);
+});
+
+test('at the daily cap, a run a stop parked still gets its stored result, and the next job waits for midnight', async (t) => {
+  const h = setup(t, { env: { REVIEW_ENGINE: 'claude', REVIEW_DAILY_CAP: '1' } });
+  stopOnceTheRunBegins(h);
+  const { sha } = await h.once({});
+  assert.equal(h.store.paidRunsOn(START), 1);
+  h.stop.on = false;
+  assert.equal((await h.d.runOnce()).review, 'success', 'it is at the cap, and needs no run');
+  assert.equal(h.review(sha).at(-1).state, 'success');
+  assert.equal((await h.once({})).r.paused, 'daily');
+  assert.equal(h.calls().length, 1);
+});
+
+test('a stop before the money is spent: at every step up to the run, no run starts and none is counted, and resume pays once', async (t) => {
+  // Each lands the stop while that step is under way, the first time only.
+  const during = (h, target, method) => {
+    const real = target[method];
+    target[method] = async (...a) => {
+      target[method] = real;
+      h.stop.on = true;
+      return real(...a);
+    };
+  };
+  const steps = {
+    'the tests': (h) => during(h, h.d, 'runTests'),
+    'fetching the diff': (h) => during(h, h.gh, 'compareFiles'),
+    'fetching the source': (h) => during(h, h.gh, 'downloadTarball'),
+    'the head check': (h) => during(h, h.gh, 'getPull'),
+  };
+  for (const [name, arrange] of Object.entries(steps)) {
+    const h = setup(t);
+    arrange(h);
+    const { pr, sha, r } = await h.once({});
+    assert.equal(r.parked, true, name);
+    assert.equal(h.calls().length, 0, `${name}: the CLI never started`);
+    assert.equal(h.store.reviewRuns(pr, sha).length, 0, `${name}: nothing counted`);
+    assert.deepEqual(h.gh.statuses, [], name);
+    assert.deepEqual(h.jobDirs(), [], name);
+    assert.equal(h.store.getJob(pr, sha).attempts, 0, name);
+    h.stop.on = false;
+    assert.equal((await h.d.runOnce()).review, 'success', name);
+    assert.equal(h.calls().length, 1, name);
+  }
+});
+
+test('a stop that kills the cleaning container does not look like a source too large to review', async (t) => {
+  const h = setup(t, { sandbox: { cleanTree: async () => {
+    h.stop.on = true;
+    throw Object.assign(new Error('cleaning the source was killed'), { code: 'TOO_LARGE' });
+  } } });
+  const { sha, r } = await h.once({});
+  assert.equal(r.parked, true);
+  assert.deepEqual(h.review(sha), [], 'no failure was posted for a container the stop ended');
+});
+
+test('a paid run that hits a limit during a stop: the pause holds, the job is parked, and after resume it waits out the pause', async (t) => {
+  const h = setup(t);
+  stopOnceTheRunBegins(h);
+  const { pr, sha, r } = await h.once({ result: { is_error: true, result: LIMIT_STRINGS[0] } });
+  assert.equal(r.parked, true);
+  assert.deepEqual(h.gh.statuses, [], 'nothing posted about the pause while stopped');
+  assert.equal(h.store.reviewPause(START).kind, 'limit', 'but the pause is real, and recorded');
+  assert.equal(h.store.getJob(pr, sha).attempts, 0);
+
+  h.stop.on = false;
+  const held = await h.d.runOnce();
+  assert.equal(held.paused, 'limit');
+  assert.equal(h.calls().length, 1, 'no second run against a limit');
+  const job = h.store.getJob(pr, sha);
+  assert.deepEqual([job.attempts, job.next_attempt_at], [0, START + HOUR]);
+  assert.equal(h.review(sha).at(-1).description, STATUS_TEXT.limit);
+
+  // A stop while it waits changes nothing, and a pause that ends during the stop waits for the resume.
+  h.stop.on = true;
+  h.control({});
+  h.clock.t = START + HOUR;
+  assert.equal(await h.d.runOnce(), null);
+  assert.equal(h.store.getJob(pr, sha).attempts, 0);
+  h.stop.on = false;
+  assert.equal((await h.d.runOnce()).review, 'success');
+  assert.equal(h.store.reviewPause(h.clock.t), null);
+});
+
+test('only a valid result is stored: a run a stop parked that came back invalid is paid for again, within the cap', async (t) => {
+  const h = setup(t);
+  stopOnceTheRunBegins(h);
+  const { pr, sha } = await h.once({ output: goodOutput('b'.repeat(40)) });
+  assert.equal(h.store.reviewRuns(pr, sha)[0].outcome, 'invalid');
+  h.stop.on = false;
+  h.control({});
+  assert.equal((await h.d.runOnce()).review, 'success');
+  assert.equal(h.calls().length, 2);
+  assert.equal(h.store.paidRunsOn(START), 2);
+});
+
+test('a stop that arrives during posting lets the result finish: never half-posted', async (t) => {
+  const h = setup(t);
+  const real = h.gh.setStatus;
+  h.gh.setStatus = async (...a) => {
+    h.stop.on = true;
+    return real(...a);
+  };
+  const { pr, sha, r } = await h.once({});
+  assert.equal(r.review, 'success');
+  assert.equal(h.gh.statuses.length, 2);
+  assert.equal(h.gh.comments.length, 1);
+  assert.equal(h.store.getJob(pr, sha).state, 'done');
+});
+
+test('shadow and the stop: nothing starts and nothing is posted during one, and the job is done regardless', async (t) => {
+  const env = { REVIEW_ENGINE: 'shadow', REVIEW_DAILY_CAP: '100' };
+  const shadowOf = (h) => h.gh.statuses.filter((s) => s.context === SHADOW_CONTEXT);
+
+  const before = setup(t, { env });
+  const real = before.gh.setStatus;
+  before.gh.setStatus = async (...a) => {
+    before.stop.on = true; // during the required checks' posting
+    return real(...a);
+  };
+  const a = await before.once({});
+  assert.equal(a.r.review, 'success');
+  assert.equal(before.store.getJob(a.pr, a.sha).state, 'done');
+  assert.equal(before.calls().length, 0, 'the stop came first, so the paid run did not start');
+  assert.deepEqual(shadowOf(before), []);
+
+  const during = setup(t, { env });
+  stopOnceTheRunBegins(during);
+  const b = await during.once({});
+  assert.equal(b.r.review, 'success');
+  assert.equal(during.calls().length, 1);
+  assert.deepEqual(shadowOf(during), [], 'its verdict is not posted during the stop');
+  assert.equal(during.store.reviewRuns(b.pr, b.sha)[0].outcome, 'valid', 'but it is kept');
+
+  const lastLook = setup(t, { env });
+  const head = lastLook.gh.getPull;
+  lastLook.gh.getPull = async (...x) => {
+    lastLook.stop.on = true;
+    return head(...x);
+  };
+  const c = await lastLook.once({});
+  assert.equal(c.r.review, 'success');
+  assert.equal(lastLook.calls().length, 0);
+  assert.deepEqual(shadowOf(lastLook), []);
+});
+
+// --- where the features meet: a GitHub App outage ---------------------------
+
+const authOutage = () => Object.assign(new Error('the app could not get a token'), { authOutage: true });
+
+test('an auth outage anywhere in the paid path holds the job: no attempt used, no run counted, no status, nothing left on disk', async (t) => {
+  for (const step of ['compareFiles', 'downloadTarball', 'getPull']) {
+    const h = setup(t);
+    const real = h.gh[step];
+    let out = true;
+    h.gh[step] = async (...a) => {
+      if (out) throw authOutage();
+      return real(...a);
+    };
+    const { pr, sha, r } = await h.once({});
+    assert.deepEqual(r, { pr, sha, retry: true, failed: false }, step);
+    const job = h.store.getJob(pr, sha);
+    assert.deepEqual([job.state, job.attempts, job.next_attempt_at], ['queued', 0, START + AUTH_HOLD_MS], step);
+    assert.equal(h.calls().length, 0, step);
+    assert.equal(h.store.reviewRuns(pr, sha).length, 0, step);
+    assert.equal(h.store.paidRunsOn(START), 0, step);
+    assert.deepEqual(h.gh.statuses, [], `${step}: GitHub would refuse a status`);
+    assert.deepEqual(h.jobDirs(), [], step);
+
+    // However long it lasts, it can never use up the job.
+    for (let i = 0; i < MAX_ATTEMPTS + 2; i++) {
+      h.clock.t += AUTH_HOLD_MS;
+      await h.d.runOnce();
+      assert.equal(h.store.getJob(pr, sha).attempts, 0, step);
+      assert.equal(h.store.getJob(pr, sha).state, 'queued', step);
+    }
+    assert.equal(h.store.paidRunsOn(h.clock.t), 0, step);
+
+    out = false;
+    h.clock.t += AUTH_HOLD_MS;
+    assert.equal((await h.d.runOnce()).review, 'success', step);
+    assert.equal(h.calls().length, 1, step);
+  }
+});
+
+test('the real client lets an auth outage through from each call the paid path makes', async () => {
+  const github = new ReviewGitHub({ repo: 'o/r', auth: { token: async () => { throw authOutage(); }, describe: () => 'test' } });
+  for (const call of [() => github.getPull(1), () => github.compareFiles('main', shaOf(1)), () => github.downloadTarball(shaOf(1))]) {
+    assert.equal((await call().catch((e) => e)).authOutage, true);
+  }
+});
+
+test('an outage while posting a paid result: it is held, and what was paid for is posted once GitHub answers, with no second run', async (t) => {
+  const h = setup(t);
+  const real = h.gh.setStatus;
+  let out = true;
+  h.gh.setStatus = async (...a) => {
+    if (out) throw authOutage();
+    return real(...a);
+  };
+  const { pr, sha, r } = await h.once({});
+  assert.equal(r.retry, true);
+  assert.equal(h.store.getJob(pr, sha).attempts, 0);
+  assert.equal(h.calls().length, 1);
+  out = false;
+  h.clock.t += AUTH_HOLD_MS;
+  assert.equal((await h.d.runOnce()).review, 'success');
+  assert.equal(h.calls().length, 1, 'no second run');
+  assert.equal(h.store.paidRunsOn(h.clock.t), 1);
+});
+
+test('an outage while posting a pause does not disturb the pause: the job still waits for its end, with no attempt used', async (t) => {
+  const h = setup(t);
+  h.gh.setStatus = async () => { throw authOutage(); };
+  const { pr, sha, r } = await h.once({ result: { is_error: true, result: LIMIT_STRINGS[0] } });
+  assert.equal(r.paused, 'limit');
+  const job = h.store.getJob(pr, sha);
+  assert.deepEqual([job.state, job.attempts, job.next_attempt_at], ['queued', 0, START + HOUR]);
+});
+
+test('during a pause, an outage still only holds; a stop beats a hold; and neither touches the pause', async (t) => {
+  const h = setup(t);
+  h.store.pauseForLimit(START);
+  const real = h.gh.compareFiles;
+  h.gh.compareFiles = async () => { throw authOutage(); };
+  const { pr, sha, r } = await h.once({});
+  assert.deepEqual(r, { pr, sha, retry: true, failed: false });
+  assert.equal(h.store.getJob(pr, sha).next_attempt_at, START + AUTH_HOLD_MS, 'it looks again soon, in case the outage ends first');
+  assert.equal(h.store.reviewPause(START + 1).until, START + HOUR);
+
+  h.gh.compareFiles = async () => {
+    h.stop.on = true;
+    throw authOutage();
+  };
+  h.clock.t += AUTH_HOLD_MS;
+  assert.equal((await h.d.runOnce()).parked, true);
+  assert.equal(h.store.getJob(pr, sha).attempts, 0);
+  assert.equal(h.store.reviewPause(h.clock.t).until, START + HOUR);
+
+  h.stop.on = false;
+  h.gh.compareFiles = real;
+  const paused = await h.d.runOnce();
+  assert.equal(paused.paused, 'limit');
+  assert.equal(h.store.getJob(pr, sha).next_attempt_at, START + HOUR);
+  assert.equal(h.calls().length, 0);
+});
+
+test('one job through every kind of wait, many times over: it is never used up, and it pays only when it really runs', async (t) => {
+  const h = setup(t);
+  const { pr, sha } = h.queue();
+  const attempts = () => h.store.getJob(pr, sha).attempts;
+  const realCompare = h.gh.compareFiles;
+  h.control({ result: { is_error: true, result: LIMIT_STRINGS[0] } });
+  for (let i = 0; i < MAX_ATTEMPTS + 2; i++) {
+    h.stop.on = false;
+    // A stop.
+    h.gh.compareFiles = async (...a) => {
+      h.stop.on = true;
+      return realCompare(...a);
+    };
+    assert.equal((await h.d.runOnce()).parked, true);
+    assert.equal(attempts(), 0);
+    h.stop.on = false;
+    // An outage.
+    h.gh.compareFiles = async () => { throw authOutage(); };
+    assert.equal((await h.d.runOnce()).retry, true);
+    assert.equal(attempts(), 0);
+    h.gh.compareFiles = realCompare;
+    h.clock.t = h.store.getJob(pr, sha).next_attempt_at;
+    // A limit.
+    assert.equal((await h.d.runOnce()).paused, 'limit');
+    assert.equal(attempts(), 0);
+    h.clock.t = h.store.getJob(pr, sha).next_attempt_at;
+  }
+  assert.equal(h.calls().length, MAX_ATTEMPTS + 2, 'only the runs that got as far as the model');
+  h.control({});
+  assert.equal((await h.d.runOnce()).review, 'success');
+  assert.equal(attempts(), 1);
+  assert.equal(h.store.getJob(pr, sha).state, 'done');
+});
+
+test('shadow and an outage: the job is done, the required checks stand, and it is only logged', async (t) => {
+  const h = setup(t, { env: { REVIEW_ENGINE: 'shadow', REVIEW_DAILY_CAP: '100' } });
+  const real = h.gh.getPull;
+  h.gh.getPull = async () => { throw authOutage(); };
+  const { pr, sha, r } = await h.once({});
+  assert.equal(r.review, 'success');
+  assert.equal(h.store.getJob(pr, sha).state, 'done');
+  assert.equal(h.calls().length, 0);
+  assert.ok(h.logs.some((l) => l.includes('shadow review did not finish')));
+  h.gh.getPull = real;
+});
+
+// --- where the features meet: override --------------------------------------
+
+function override(t, h, pr, over = {}) {
+  const logFile = join(h.dir, 'override.log');
+  const said = [];
+  return {
+    said,
+    logFile,
+    run: runOverride({
+      pr, reason: 'needs to ship', github: h.gh, store: h.store, logFile, say: (m) => said.push(m), by: 'someone',
+      confirm: async () => true, now: () => new Date(h.clock.t), ...over,
+    }),
+  };
+}
+
+const overrideCases = {
+  limit: { result: { is_error: true, result: LIMIT_STRINGS[0] } },
+  auth: { result: { is_error: true, result: 'Invalid API key' } },
+};
+
+test('override works on a job waiting out a pause, which is the outage it is for, and that job can no longer replace it', async (t) => {
+  for (const [kind, control] of Object.entries(overrideCases)) {
+    const h = setup(t);
+    const { pr, sha, r } = await h.once(control);
+    assert.equal(r.paused, kind);
+    const o = override(t, h, pr);
+    assert.equal(await o.run, 0, o.said.join('\n'));
+    assert.deepEqual(h.review(sha).at(-1), { sha, context: CONTEXTS.review, state: 'success', description: OVERRIDE_TEXT }, kind);
+    assert.ok(o.said.some((l) => l.includes('takes it out of the queue')), kind);
+    const job = h.store.getJob(pr, sha);
+    assert.equal(job.state, 'superseded', kind);
+    assert.match(job.last_error, /override/, kind);
+    assert.match(readFileSync(o.logFile, 'utf8'), /posted sha=/);
+
+    // When the pause ends, or the operator restarts, nothing runs and nothing replaces it.
+    h.control({});
+    h.store.clearPause();
+    h.clock.t += 1000 * HOUR;
+    assert.equal(await h.d.runOnce(), null, kind);
+    assert.equal(h.calls().length, 1, kind);
+    assert.equal(h.review(sha).at(-1).description, OVERRIDE_TEXT, kind);
+    // retry is still there, for an operator who changes their mind.
+    assert.equal(h.store.retry(pr), true, kind);
+    assert.equal((await h.d.runOnce()).review, 'success', kind);
+  }
+});
+
+test('override works on a job waiting for the daily cap, and leaves other waiting jobs and the pause alone', async (t) => {
+  const h = setup(t, { env: { REVIEW_ENGINE: 'claude', REVIEW_DAILY_CAP: '0' } });
+  const a = await h.once({});
+  const b = await h.once({});
+  assert.equal(a.r.paused, 'daily');
+  assert.equal(await override(t, h, a.pr).run, 0);
+  assert.equal(h.store.getJob(a.pr, a.sha).state, 'superseded');
+  assert.equal(h.store.getJob(b.pr, b.sha).state, 'queued');
+  assert.equal(h.review(b.sha).at(-1).state, 'error');
+
+  const p = setup(t);
+  const first = await p.once(overrideCases.limit);
+  const second = await p.once({});
+  assert.equal(await override(t, p, first.pr).run, 0);
+  assert.equal(p.store.reviewPause(START).kind, 'limit', 'the pause is about the account, and still holds');
+  assert.equal(p.store.getJob(second.pr, second.sha).next_attempt_at, START + HOUR);
+});
+
+test('override still refuses a review that will soon post: due, parked by a stop, held for an outage, or running', async (t) => {
+  // Queued and due.
+  const due = setup(t);
+  const q = due.queue();
+  assert.equal(await override(t, due, q.pr).run, 1);
+  assert.deepEqual(due.gh.statuses, []);
+
+  // A pause has ended, so it is about to probe.
+  const ended = setup(t);
+  const e = await ended.once(overrideCases.limit);
+  ended.clock.t = START + HOUR;
+  assert.equal(await override(t, ended, e.pr).run, 1);
+  assert.equal(ended.store.getJob(e.pr, e.sha).state, 'queued');
+
+  // Parked by a stop: it would post on resume.
+  const stopped = setup(t);
+  const real = stopped.gh.compareFiles;
+  stopped.gh.compareFiles = async (...a) => {
+    stopped.stop.on = true;
+    return real(...a);
+  };
+  const s = await stopped.once({});
+  assert.equal(s.r.parked, true);
+  assert.equal(await override(t, stopped, s.pr).run, 1);
+
+  // Held for an outage: it comes back in 30 seconds, and this could not post anyway.
+  const held = setup(t);
+  held.gh.compareFiles = async () => { throw authOutage(); };
+  const o = await held.once({});
+  assert.equal(await override(t, held, o.pr).run, 1);
+  assert.equal(held.store.getJob(o.pr, o.sha).state, 'queued');
+
+  // Running.
+  const running = setup(t);
+  const r = running.queue();
+  running.store.markRunning(r.pr, r.sha);
+  assert.equal(await override(t, running, r.pr).run, 1);
+});
+
+test('override on a paused job: a failed post puts it back as it was, a dry run changes nothing, and a job that became due meanwhile is refused', async (t) => {
+  const failing = setup(t);
+  const f = await failing.once(overrideCases.limit);
+  const before = failing.store.getJob(f.pr, f.sha);
+  failing.gh.setStatus = async () => { throw new Error('GitHub down'); };
+  assert.equal(await override(t, failing, f.pr).run, 1);
+  const after = failing.store.getJob(f.pr, f.sha);
+  assert.deepEqual([after.state, after.next_attempt_at, after.last_error, after.attempts], [before.state, before.next_attempt_at, before.last_error, before.attempts]);
+
+  const dry = setup(t);
+  const d = await dry.once(overrideCases.limit);
+  assert.equal(await override(t, dry, d.pr, { dryRun: true }).run, 0);
+  assert.equal(dry.store.getJob(d.pr, d.sha).state, 'queued', 'a rehearsal leaves the queue alone');
+
+  // The hold ends in the seconds between the last look and the closing.
+  const racing = setup(t);
+  const c = await racing.once(overrideCases.limit);
+  const realClose = racing.store.closeWaitingJob.bind(racing.store);
+  racing.store.closeWaitingJob = (pr, sha, now, why) => realClose(pr, sha, racing.store.getJob(pr, sha).next_attempt_at, why);
+  const beforeStatuses = racing.gh.statuses.length;
+  assert.equal(await override(t, racing, c.pr).run, 1);
+  assert.equal(racing.gh.statuses.length, beforeStatuses, 'nothing posted');
+  assert.equal(racing.store.getJob(c.pr, c.sha).state, 'queued');
+});
+
+test('override works after a final error, with the shadow engine, with the mock, and with no engine at all', async (t) => {
+  const final = setup(t);
+  const a = await final.once({ output: goodOutput('b'.repeat(40)) });
+  assert.equal(a.r.review, 'error');
+  assert.equal(await override(t, final, a.pr).run, 0);
+  assert.equal(final.review(a.sha).at(-1).description, OVERRIDE_TEXT);
+
+  const skipped = setup(t, { runTests: async () => ({ state: 'failure', summary: 'x' }) });
+  const b = await skipped.once({});
+  assert.equal(await override(t, skipped, b.pr).run, 0);
+  assert.equal(skipped.tests(b.sha).at(-1).state, 'failure', 'adabra/tests is not touched');
+
+  for (const env of [{ REVIEW_ENGINE: 'shadow' }, { REVIEW_ENGINE: 'mock' }, {}]) {
+    const h = setup(t, { env });
+    const c = await h.once({});
+    assert.equal(await override(t, h, c.pr).run, 0, JSON.stringify(env));
+    assert.equal(h.review(c.sha).at(-1).description, OVERRIDE_TEXT);
+  }
+});
+
+test('the override, status and retry commands do not build a review engine, so any REVIEW_ENGINE leaves them working', (t) => {
+  const text = readFileSync(join(REPO, 'reviewer', 'main.js'), 'utf8');
+  assert.match(text, /cmd === 'override'\) \{\n\s*process\.exit\(await overrideCommand\(\{ args, store, github, dryRun/, 'its github is a function, not the dispatcher');
+  const dir = mkdtempSync(join(tmpdir(), 'adabra-engine-cmd-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const run = (args, engine) => spawnSync(process.execPath, [join(REPO, 'reviewer', 'main.js'), ...args], {
+    encoding: 'utf8',
+    env: { PATH: process.env.PATH, HOME: dir, REVIEW_DB: join(dir, 'reviewer.db'), ADABRA_STOP_FILE: join(dir, 'stop.json'), REVIEW_ENGINE: engine },
+  });
+  for (const engine of ['not-an-engine', 'claude', 'shadow', 'mock', '']) {
+    const o = run(['override', '5', '--reason', 'x'], engine);
+    assert.equal(o.status, 2, engine);
+    assert.match(o.stdout, /needs an interactive terminal/, `${engine}: it got as far as its own first check`);
+    assert.ok(!/REVIEW_ENGINE/.test(o.stdout + o.stderr), engine);
+    assert.equal(run(['status'], engine).status, 0, engine);
+    assert.match(run(['retry', '5'], engine).stdout, /no jobs for PR #5/, engine);
+  }
+});
+
+test('a bad REVIEW_ENGINE stops only what would run a review, with no job started', (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'adabra-engine-cmd-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  writeFileSync(join(dir, 'token'), 'not-a-real-token');
+  const r = spawnSync(process.execPath, [join(REPO, 'reviewer', 'main.js'), 'poll-once'], {
+    encoding: 'utf8',
+    env: { PATH: process.env.PATH, HOME: dir, REVIEW_DB: join(dir, 'reviewer.db'), GITHUB_REPO: 'o/r', REVIEW_TOKEN_FILE: join(dir, 'token'), REVIEW_AUTHORS: 'alice', REVIEW_ENGINE: 'not-an-engine' },
+  });
+  assert.notEqual(r.status, 0);
+  assert.match(r.stderr, /REVIEW_ENGINE must be mock, shadow or claude/);
+});
+
+test('the default, with a stop in force and after it: the mock, no job directory, no sudo', async (t) => {
+  const h = setup(t, { env: {} });
+  h.stop.on = true;
+  const q = h.queue();
+  assert.equal(await h.d.runOnce(), null);
+  h.stop.on = false;
+  assert.equal((await h.d.runOnce()).review, 'success');
+  assert.ok(!existsSync(h.stack.sudoLog));
+  assert.deepEqual(h.jobDirs(), []);
+  assert.equal(h.gh.tarballs, 0);
+  assert.match(h.gh.comments[0].body, /Review by mock-v1/);
+  assert.equal(h.store.getJob(q.pr, q.sha).state, 'done');
 });

@@ -185,7 +185,7 @@ export class Dispatcher {
   // No verdict is not a pass, and a review of a commit whose tests did not pass is money for nothing.
   async #review(job, tests) {
     if (this.runReview.paid && tests.state !== 'success') return normalize({ state: 'error', summary: STATUS_TEXT.skipped }, 'review');
-    return normalize(await this.runReview(job), 'review');
+    return normalize(await this.runReview(job, { halted: () => this.#halted() }), 'review');
   }
 
   // The reviewer is paused, not the PR. The tests' real result still goes up, the review says why it has none, and the job waits
@@ -215,14 +215,15 @@ export class Dispatcher {
   }
 
   // Comparison only: nothing here can touch the job, its required checks or its comment. The model's text stays in the local log.
+  // A stop is obeyed here as well: nothing starts and nothing is posted, and the job, being done, does not come back for it.
   async #shadow(job, tests) {
-    if (!this.shadowReview) return;
+    if (!this.shadowReview || this.#halted()) return;
     const label = `PR #${job.pr} ${job.sha.slice(0, 12)}`;
     let state = 'error';
     let text = STATUS_TEXT.skipped;
     if (tests.state === 'success') {
       try {
-        const r = normalize(await this.shadowReview(job), 'shadow');
+        const r = normalize(await this.shadowReview(job, { halted: () => this.#halted() }), 'shadow');
         state = r.state;
         text = r.summary;
         for (const f of r.findings) {
@@ -233,6 +234,7 @@ export class Dispatcher {
         this.log(`${label} shadow review did not finish: ${err.message}`);
       }
     }
+    if (this.#halted()) return;
     await this.github.setStatus(job.sha, SHADOW_CONTEXT, state, text)
       .catch((err) => this.log(`${label} could not post the shadow status: ${err.message}`));
   }

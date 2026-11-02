@@ -203,6 +203,20 @@ export class ReviewStore {
     this.db.prepare("UPDATE jobs SET state = 'superseded' WHERE pr = ? AND sha = ?").run(pr, sha);
   }
 
+  // Takes a job out of the queue because the operator has overridden it while it waited, so no later result can replace the override.
+  // Only if it is still waiting: false once it is due or running. `retry` can bring it back.
+  closeWaitingJob(pr, sha, now, why) {
+    const r = this.db
+      .prepare("UPDATE jobs SET state = 'superseded', last_error = ? WHERE pr = ? AND sha = ? AND state = 'queued' AND next_attempt_at > ?")
+      .run(String(why).slice(0, 500), pr, sha, now);
+    return r.changes === 1;
+  }
+
+  // Undoes closeWaitingJob, when the override could not be posted after all. next_attempt_at was left as it was.
+  reopenWaitingJob(pr, sha, lastError) {
+    this.db.prepare("UPDATE jobs SET state = 'queued', last_error = ? WHERE pr = ? AND sha = ?").run(lastError, pr, sha);
+  }
+
   // --- runs of the real review ---------------------------------------------
   paidRunsOn(now) {
     return this.db.prepare('SELECT COUNT(*) AS n FROM review_runs WHERE utc_day = ? AND paid = 1').get(utcDay(now)).n;

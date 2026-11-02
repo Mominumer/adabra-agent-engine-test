@@ -5,6 +5,7 @@ import { parseArgs } from 'node:util';
 import { operatorText, plain } from '../shared/sanitize.js';
 import { hasTerminal, typed } from '../shared/terminal.js';
 import { CONTEXTS } from './dispatcher.js';
+import { REVIEW_PAUSED } from './review-output.js';
 
 // The operator's way past a wrong or stuck adabra/review. It says `success` on the PR's current head commit and on nothing else:
 // statuses belong to a commit, so a new push loses it. It never touches adabra/tests, and it puts nothing the operator typed on
@@ -18,6 +19,13 @@ export const overrideLogPath = (env = process.env, home = homedir) =>
   env.REVIEW_LOG_FILE?.trim() || join(home(), 'Library', 'Logs', 'adabra-reviewer.log');
 
 const USAGE = 'usage: override <pr> --reason "..."';
+const CLOSED_BY_OVERRIDE = 'closed by an operator override';
+
+// A real review that is paused (a limit, a credential, the daily cap) keeps its job queued, perhaps for hours. That is an outage blocking
+// a merge, which is what this command is for, so such a job does not make it refuse. It is taken out of the queue instead, so that its
+// result can never replace the override.
+const waitingOutPause = (job, at) => job.state === 'queued' && job.next_attempt_at > at && String(job.last_error ?? '').startsWith(REVIEW_PAUSED);
+
 const whoAmI = () => {
   try {
     return userInfo().username;
@@ -56,10 +64,11 @@ export async function runOverride({
     if (pull.merged) return { refuse: `PR #${pr} is already merged` };
     if (pull.state !== 'open') return { refuse: `PR #${pr} is closed` };
     const job = store.getJob(pr, pull.sha);
-    if (job?.state === 'queued' || job?.state === 'running') {
+    const waiting = Boolean(job) && waitingOutPause(job, now().getTime());
+    if (!waiting && (job?.state === 'queued' || job?.state === 'running')) {
       return { refuse: `a review of ${pull.sha.slice(0, 12)} is ${job.state}, and its result would replace the override. Wait for it to finish, then run this again` };
     }
-    return { pull, known: Boolean(job) };
+    return { pull, known: Boolean(job), waiting, lastError: job?.last_error ?? null };
   };
 
   const first = await look();
@@ -74,6 +83,7 @@ export async function runOverride({
   say(`  reason: ${reason}`);
   say(`This sets ${CONTEXTS.review} to success on that commit only. ${CONTEXTS.tests} is not touched. A new push loses it.`);
   if (!first.known) say('The reviewer has not seen this commit. If it is eligible for review, the next poll queues it and replaces the override.');
+  if (first.waiting) say('The review of this commit is paused and waiting. This takes it out of the queue, so it will not run later. retry brings it back.');
   if (!(await confirm(`Type "override ${pr}" to confirm: `, `override ${pr}`))) {
     say('Not confirmed. Nothing posted.');
     return 1;
@@ -105,9 +115,17 @@ export async function runOverride({
       say(`Could not add to the log ${logFile}: ${err.code ?? err.message}`);
     }
   };
+  // Closed before posting, so the job cannot start in between and overwrite the status. A dry run changes nothing here.
+  const close = second.waiting && !dryRun;
+  if (close && !store.closeWaitingJob(pr, pull.sha, now().getTime(), CLOSED_BY_OVERRIDE)) {
+    note(`refused sha=${pull.sha}: the review started while being asked`);
+    say(`Refused: the review of ${pull.sha.slice(0, 12)} has just become due, and its result would replace the override. Nothing posted.`);
+    return 1;
+  }
   try {
     await github.setStatus(pull.sha, CONTEXTS.review, 'success', OVERRIDE_TEXT);
   } catch (err) {
+    if (close) store.reopenWaitingJob(pr, pull.sha, second.lastError);
     const why = plain(err.message).slice(0, 300);
     note(`FAILED sha=${pull.sha}: ${why}`);
     say(`Could not post the status: ${why}`);

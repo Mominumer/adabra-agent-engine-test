@@ -22,10 +22,13 @@ export const STATUS_TEXT = {
   transient: 'Review could not complete; the operator can retry',
 };
 
+// What a job waiting out a pause says in its last_error, so override can tell it from a job that is about to run.
+export const REVIEW_PAUSED = 'review paused';
+
 // While this is thrown no paid run starts and the job waits without using an attempt. kind: limit | auth | daily.
 export class ReviewPaused extends Error {
   constructor(kind, until = null) {
-    super(`review paused: ${kind}`);
+    super(`${REVIEW_PAUSED}: ${kind}`);
     this.kind = kind;
     this.until = until;
     this.statusText = STATUS_TEXT[kind];
@@ -37,6 +40,13 @@ export class ReviewSuperseded extends Error {
   constructor() {
     super('review skipped: the commit is no longer the head of an open PR');
     this.statusText = STATUS_TEXT.superseded;
+  }
+}
+
+// The operator's emergency stop landed before the money was spent. The dispatcher parks the job, as for any stopped run.
+export class ReviewHalted extends Error {
+  constructor() {
+    super('review not started: stopped by the operator');
   }
 }
 

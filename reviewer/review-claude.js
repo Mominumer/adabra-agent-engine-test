@@ -4,7 +4,7 @@ import { buildJobDir, JOB_ROOT, removeJobDir, sweepJobDirs } from './job-dir.js'
 import { diffText, preCheck, UNSHOWN_OK } from './precheck.js';
 import { OPT, readPaths } from './review-check.js';
 import { mockReview } from './review-mock.js';
-import { judgeRun, localDetail, MAX_OUTPUT_BYTES, ReviewPaused, reviewSummary, ReviewSuperseded, STATUS_TEXT } from './review-output.js';
+import { judgeRun, localDetail, MAX_OUTPUT_BYTES, ReviewHalted, ReviewPaused, reviewSummary, ReviewSuperseded, STATUS_TEXT } from './review-output.js';
 import { nextUtcMidnight } from './store.js';
 import { parseTaskId } from './task-results.js';
 
@@ -125,7 +125,9 @@ export function claudeReview({
     throw new Error(`review step failed (${judged.class}); it will be retried`);
   };
 
-  const review = async (job) => {
+  // halted: whether the operator's stop has landed on this job. A stop cannot end a run once it has started, so it is asked at the last
+  // moment before one. After that the run finishes, its result is stored and counted, and the dispatcher posts nothing.
+  const review = async (job, { halted = () => false } = {}) => {
     const label = `PR #${job.pr} ${job.sha.slice(0, 12)}`;
     const meta = job.meta ?? {};
     const key = { pr: job.pr, sha: job.sha, skill, model };
@@ -147,6 +149,7 @@ export function claudeReview({
     const paused = store.reviewPause(now());
     if (paused) throw new ReviewPaused(paused.kind, paused.until);
     if (store.paidRunsOn(now()) >= dailyCap) throw new ReviewPaused('daily', nextUtcMidnight(now()));
+    if (halted()) throw new ReviewHalted();
 
     const written = await writeJob(job, files, meta);
     if (written.final) return shaped({ ...written.final, reviewer: PRECHECK_REVIEWER });
@@ -154,6 +157,7 @@ export function claudeReview({
       // The last moment before spending. Fetching and cleaning take time, and a push may have landed meanwhile.
       const head = await github.getPull(job.pr);
       if (!head || head.state !== 'open' || head.sha !== job.sha) throw new ReviewSuperseded();
+      if (halted()) throw new ReviewHalted();
       // Counted before it starts, so a crash during the run still counts it.
       const runId = store.beginReviewRun({ ...key, now: now(), cap: dailyCap });
       if (runId === null) throw new ReviewPaused('daily', nextUtcMidnight(now()));
