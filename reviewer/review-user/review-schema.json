@@ -1,0 +1,24 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["verdict", "sha", "findings"],
+  "properties": {
+    "verdict": { "enum": ["pass", "fail"] },
+    "sha": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "findings": {
+      "type": "array",
+      "maxItems": 50,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["file", "line", "severity", "message"],
+        "properties": {
+          "file": { "type": ["string", "null"], "maxLength": 300 },
+          "line": { "type": ["integer", "null"], "minimum": 1 },
+          "severity": { "enum": ["blocker", "major", "minor"] },
+          "message": { "type": "string", "maxLength": 500 }
+        }
+      }
+    }
+  }
+}

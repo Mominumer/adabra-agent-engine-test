@@ -1,0 +1,7 @@
+{
+  "disableAllHooks": true,
+  "permissions": {
+    "blockReadsOutsideWorkingDirectories": true,
+    "deny": ["Read(//Users/**)"]
+  }
+}

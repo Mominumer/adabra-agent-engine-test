@@ -176,6 +176,38 @@ which ends the reservation. The owner is the device the task is reserved for, el
 claimed it last, even if they have released. A passing review also ends it. If the owner has gone away, revoking the device
 ends it, as does `node coordinator/main.js task-assign TASK-7 <device-id|none>`.
 
+## Review user containment (Mac mini, no model yet)
+
+The real review will read untrusted PR text, so it runs as a separate macOS user that holds no GitHub token and cannot enter the
+dispatcher's home folder. This part builds and proves that boundary. **Nothing here can call Claude**: the wrapper has no model
+step, never loads the credential, and exits 78 if asked to review. `adabra/review` is still the mock.
+
+```
+dispatcher (holds the review GitHub token)
+  1. cleans the commit's tarball in a sandbox container: reviewer/clean-worker.cjs, no PR code runs
+  2. unpacks only the clean result into /opt/adabra-review/in/<pr>-<sha>-<time>/ : tree/, diff.patch, pr.json, manifest.json
+     owner dispatcher, group adabra-review, dirs 750, files 640, so the review user can read it and cannot change it
+  3. sudo -n -u adabra-review /opt/adabra-review/bin/run-review <job-id>
+wrapper (root-owned, as adabra-review): starts from an empty environment, accepts only a job id, refuses a job holding a link
+```
+
+The cleaning step keeps only regular text files. It drops symlinks, hardlinks, devices and fifos, paths that are absolute or use
+`..`, names with control or invisible characters, agent config at any depth (`.claude/`, `CLAUDE.md`, `CLAUDE.local.md`,
+`AGENTS.md`, `.mcp.json`, in any case), binaries, files over 1 MB and anything past 50 MB or 20,000 files. `manifest.json` lists
+what was dropped. A change to a dropped file still shows as text in `diff.patch`.
+
+```bash
+sudo service/review-user.sh install        # root-owned wrapper and settings, the job root, one sudoers line; safe to re-run
+node reviewer/main.js review-check         # must end with "review user is contained"; needs no sudo, token or database
+sudo service/review-user.sh uninstall      # removes them; keeps the user, its login and the CLI
+```
+
+The wrapper and its settings are copies owned by root, so a merged PR changes nothing here until the installer runs again.
+`review-check` probes from the review user's side: tokens and databases `denied`, Docker `refused`, a job readable but not
+writable, only allowed environment variables. A canary file and the Docker socket are its positive controls: the dispatcher can
+reach both, so the review user's refusal means something. Its probes open and close files without reading them, and it never
+prints a file's contents.
+
 ## Not built yet (by design)
 
 Claim/lease validation (`claim_generation` is carried but not checked), cancellation, review workers, context
