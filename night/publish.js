@@ -4,7 +4,7 @@ import { READ_YOURSELF } from '../reviewer/precheck.js';
 import { sendAuthorized } from '../shared/github-auth.js';
 import { runCommand } from './containers.js';
 import { tokenReader } from './github-read.js';
-import { agreeWithGit, agreeWithTree, pathRefusal } from './validate.js';
+import { agreeWithBase, agreeWithGit, agreeWithTree, pathRefusal } from './validate.js';
 
 // Turns a validated diff into one branch and one pull request. The session's work reaches a commit in one way: as a patch applied to the
 // pinned commit's tree, in a fresh temp repository with no working tree at all. So the patch cannot write a file, wherever its paths
@@ -128,6 +128,11 @@ export async function prepareCommit({ diff, validated, baseCommit, task, gitUrl,
   const before = await agreeWithGit({ diff, validated, git });
   if (!before.ok) return { refused: before };
 
+  const listed = await git(['ls-tree', '-r', '-z', '--name-only', baseCommit]);
+  if (listed.code !== 0) return { refused: { rule: 'git_disagrees', file: null, word: null } };
+  const spelt = agreeWithBase({ validated, listed: listed.stdout });
+  if (!spelt.ok) return { refused: spelt };
+
   const applied = await git(['apply', '--cached', '--whitespace=nowarn'], { input: diff });
   if (applied.code !== 0) return { refused: { rule: 'does_not_apply', file: null, word: null } };
   const tree = await git(['write-tree']);
@@ -216,7 +221,7 @@ async function revokeToken({ apiUrl, auth }) {
 
 // The whole publish. `gate(name)` runs before each stage and may throw: a PublishHold means try again later, and anything else goes
 // straight back to the caller, after the token is revoked. Resolves one of:
-//   { state: 'published', branch, commit, pull, url, reviewDecision, flagged, revoked }
+//   { state: 'published', branch, commit, pull, url, reviewDecision, flagged }
 //   { state: 'refused', rule, file, word }
 //   { state: 'unreachable', stage }             nothing went public, or the push may be tried again
 //   { state: 'pushed_no_pr', branch, commit }

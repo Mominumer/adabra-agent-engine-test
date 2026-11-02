@@ -212,10 +212,15 @@ function parseFile(lines, start) {
   return { at: hunks.at, file: { ...file, added: hunks.added, removed: hunks.removed }, text: hunks.text };
 }
 
+// `a`, `a/b` and `a/b/c` for the path `a/b/c`.
+const prefixes = (path) => {
+  const segments = path.split('/');
+  return segments.map((_, i) => segments.slice(0, i + 1).join('/'));
+};
+
 // Two paths that are one on a disk that ignores case, or a file that is also a folder.
 function collides(path, fileKeys, dirKeys) {
-  const segments = path.split('/');
-  const keys = segments.map((_, i) => fold(segments.slice(0, i + 1).join('/')));
+  const keys = prefixes(path).map(fold);
   const own = keys.at(-1);
   if (keys.slice(0, -1).some((k) => fileKeys.has(k)) || fileKeys.has(own) || dirKeys.has(own)) return true;
   fileKeys.add(own);
@@ -276,6 +281,28 @@ export async function agreeWithGit({ diff, validated, git }) {
   const wantSummary = validated.files.filter((f) => f.status !== 'modified')
     .map((f) => ` ${f.status === 'added' ? 'create' : 'delete'} mode ${f.mode} ${f.path}\n`).join('');
   if (summary.stdout !== wantSummary) return refused('git_disagrees');
+  return Object.freeze({ ok: true });
+}
+
+// The same collision, against what is already at the pinned commit, which the layers above cannot see. To git, `Service/ops.sh` beside
+// `service/ops.sh` is a new file, so it looks harmless to this parser, in the pull request and to a review on Linux. Checked out on a disk
+// that ignores case, as this machine's does, it replaces the real one. So a path, and each folder on the way to it, must be spelt as it is
+// at the pinned commit. `listed` is `git ls-tree -r -z --name-only` of that commit.
+export function agreeWithBase({ validated, listed }) {
+  const spellings = new Map();
+  for (const path of listed.split('\0').filter(Boolean)) {
+    for (const name of prefixes(path)) {
+      const key = fold(name);
+      if (!spellings.has(key)) spellings.set(key, new Set());
+      spellings.get(key).add(name);
+    }
+  }
+  for (const [i, file] of validated.files.entries()) {
+    for (const name of prefixes(file.path)) {
+      const there = spellings.get(fold(name));
+      if (there && !there.has(name)) return refused('path_collision', i + 1);
+    }
+  }
   return Object.freeze({ ok: true });
 }
 

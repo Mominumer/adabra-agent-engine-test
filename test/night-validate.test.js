@@ -5,7 +5,7 @@ import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync,
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { gitEnvironment, gitRunner, prepareCommit } from '../night/publish.js';
-import { MAX_DIFF_BYTES, MAX_FILES, PROTECTED_WORDS, RULES, agreeWithGit, agreeWithTree, credentialShaped, pathRefusal, protectedWord, validateDiff } from '../night/validate.js';
+import { MAX_DIFF_BYTES, MAX_FILES, PROTECTED_WORDS, RULES, agreeWithBase, agreeWithGit, agreeWithTree, credentialShaped, pathRefusal, protectedWord, validateDiff } from '../night/validate.js';
 import { makeRemote, needsGit } from './fixtures/night-stack.js';
 
 const scratch = (t) => {
@@ -305,6 +305,17 @@ test('two names for one file are refused: the same path twice, case variants, an
   assert.equal(validateDiff(`${newFile('a/b.txt')}${newFile('a/c.txt')}`).ok, true);
 });
 
+test('a path that a disk ignoring case reads as one already at the pinned commit is refused: the file, or any folder on the way', () => {
+  const listed = 'service/ops.sh\0src/deep/a.js\0README.md\0Docs/a.md\0docs/b.md\0';
+  const check = (diff) => agreeWithBase({ validated: validateDiff(diff), listed });
+  for (const path of ['Service/ops.sh', 'SERVICE/new.sh', 'readme.md', 'src/DEEP/b.js', 'SRC/new.js', 'DOCS/c.md']) {
+    assert.deepEqual({ ...check(newFile(path)) }, { ok: false, rule: 'path_collision', file: 1, word: null }, path);
+  }
+  assert.equal(check(`${newFile('src/fine.js')}${newFile('SERVICE/new.sh')}`).file, 2, 'it says which file, and not its name');
+  for (const path of ['service/new.sh', 'src/deep/b.js', 'other/x.js', 'Docs/c.md', 'docs/c.md']) assert.equal(check(newFile(path)).ok, true, path);
+  assert.equal(check(modified('README.md')).ok, true, 'spelt as it is there');
+});
+
 // --- against the real git ---
 const hermetic = (dir) => ({ PATH: process.env.PATH, HOME: dir, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null', GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@invalid', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@invalid' });
 const gitIn = (cwd, args, input) => spawnSync('git', args, { cwd, env: hermetic(cwd), ...(input === undefined ? {} : { input: Buffer.from(input) }), encoding: 'buffer' });
@@ -517,6 +528,22 @@ test('real git: a patch that does not fit the pinned commit makes no commit', ne
   const r = await prepareCommit({ diff: Buffer.from(diff), validated: validateDiff(diff), baseCommit: sha, task: 'TASK-1', gitUrl, git, dateMs: 1_800_000_000_000 });
   assert.equal(r.refused.rule, 'does_not_apply');
   assert.equal(readdirSync(join(work, 'repo.git', 'refs', 'heads')).length, 0);
+});
+
+test('real git: a new file that differs only in case from one at the pinned commit makes no commit, though git alone would make one', needsGit, async (t) => {
+  const dir = scratch(t);
+  const { remote, sha } = makeRemote(dir, { 'service/ops.sh': 'real\n' });
+  const work = join(dir, 'publish');
+  mkdirSync(work);
+  const gitUrl = `file://${remote}`;
+  const git = gitRunner({ gitCommand: 'git', env: gitEnvironment({ dir: work, gitUrl }) });
+  const diff = newFile('Service/ops.sh');
+  const validated = validateDiff(diff);
+  assert.equal(validated.ok, true, 'the diff alone looks fine: only the pinned commit shows the collision');
+  const r = await prepareCommit({ diff: Buffer.from(diff), validated, baseCommit: sha, task: 'TASK-1', gitUrl, git, dateMs: 1_800_000_000_000 });
+  assert.equal(r.refused.rule, 'path_collision');
+  assert.equal(r.refused.file, 1);
+  assert.equal(r.commit, undefined);
 });
 
 test('real git: a path through a symlink already in the tree is refused by git, even with no working tree', needsGit, async (t) => {
