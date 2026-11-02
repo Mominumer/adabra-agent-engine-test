@@ -55,9 +55,14 @@
       "Bash(service/ops.sh stop:*)",
       "Bash(service/ops.sh status)",
       "Bash(service/ops.sh check)",
+      "Bash(service/ops.sh health)",
+      "Bash(service/ops.sh health --last)",
+      "Bash(service/health-service.sh status)",
       "Bash(node ops/main.js stop:*)",
       "Bash(node ops/main.js status)",
-      "Bash(node ops/main.js check)"
+      "Bash(node ops/main.js check)",
+      "Bash(node ops/main.js health)",
+      "Bash(node ops/main.js health --last)"
     ]
   }
 }

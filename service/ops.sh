@@ -5,6 +5,8 @@
 #   service/ops.sh resume                        undo it. Typed confirmation at a terminal. Agents must not run it.
 #   service/ops.sh status                        what is in force, and why
 #   service/ops.sh check                         exit 0 = go; any other exit = do not start anything. For the overnight runner.
+#   service/ops.sh health                        OK, WARN or FAIL for each part; exit 1 on a FAIL. Only looks. Agents may run it.
+#   service/ops.sh health --last                 what the health job found last, without checking anything again
 #   service/ops.sh override <pr> --reason "..."  mark adabra/review as passed on the PR's current head commit. Typed confirmation
 #                                                at a terminal. Agents must not run it, the same as merging.
 #
@@ -25,6 +27,11 @@ case "${1:-}" in
   stop|resume|status|check)
     exec node ops/main.js "$@"
     ;;
+  health)
+    # Docker is often not on a shell's PATH. These are the places the reviewer's service looks.
+    export PATH="$PATH:$HOME/.docker/bin:/opt/homebrew/bin:/usr/local/bin"
+    exec node ops/main.js "$@"
+    ;;
   override)
     export GITHUB_REPO="${GITHUB_REPO:-Mominumer/adabra-agent-engine-test}"
     export REVIEW_DB="${REVIEW_DB:-$REPO_DIR/reviewer.db}"
@@ -40,6 +47,6 @@ case "${1:-}" in
     exec node reviewer/main.js "$@"
     ;;
   *)
-    echo "usage: $0 stop [--reason \"...\"] | resume | status | check | override <pr> --reason \"...\""; exit 2
+    echo "usage: $0 stop [--reason \"...\"] | resume | status | check | health [--last] | override <pr> --reason \"...\""; exit 2
     ;;
 esac
