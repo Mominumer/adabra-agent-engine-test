@@ -443,7 +443,77 @@ Run `resume` with the coordinator up: a lease that ran out while the coordinator
 
 **Override** acts on the head commit it showed you, looked up again after you confirm. It refuses a closed or merged PR, and refuses while a review of that commit is queued or running, because the result would replace it (a real review waiting out a pause is the exception: see above). It never touches `adabra/tests`, so a PR whose tests failed stays blocked. A new push loses it, because statuses belong to a commit. It leaves a record in `~/Library/Logs/adabra-reviewer.log` (or `REVIEW_LOG_FILE`) before it posts: if it cannot write there, it does not post. It works during a stop, because it is a person's deliberate act and no job is involved.
 
-**Who may run what.** Agents may run `stop`, `status` and `check`: stopping is the safe direction. `resume` and `override` are for a person at the mini, like merging. Both need a terminal and a typed confirmation, and `.claude/settings.json` denies them. **That is a speed bump, not a boundary.** While builder sessions run as the same macOS user as the reviewer, an agent can fake a terminal, edit the state file or read the token or key. Deny rules only bind sessions that load this repo's settings. A hard boundary needs the planned separate builder user.
+**Who may run what.** Agents may run `stop`, `status`, `check` and `health`: stopping is the safe direction, and `health` only looks. `resume` and `override` are for a person at the mini, like merging. Both need a terminal and a typed confirmation, and `.claude/settings.json` denies them. **That is a speed bump, not a boundary.** While builder sessions run as the same macOS user as the reviewer, an agent can fake a terminal, edit the state file or read the token or key. Deny rules only bind sessions that load this repo's settings. A hard boundary needs the planned separate builder user.
+
+## Health report and log rotation (Mac mini)
+
+```bash
+service/ops.sh health                    # checks everything now and only looks. Agents may run it. Exit 1 on a FAIL
+service/ops.sh health --last             # what the job found last, without checking anything again
+service/health-service.sh install        # run from the running checkout. Every 15 minutes, and once when it loads
+service/health-service.sh status         # is it loaded, and the last run. Exit 1 on a FAIL, or if it has stopped running
+service/health-service.sh run            # a run now, in the service
+service/health-service.sh drill docker   # simulate one failure: see below
+service/health-service.sh logs           # ~/Library/Logs/adabra-health.log
+service/health-service.sh uninstall      # stops the job; the status file and the logs stay
+```
+
+Each line is OK, WARN or FAIL. **A FAIL means someone should act.** A WARN is worth knowing and nothing is broken.
+
+| Check | OK | WARN | FAIL |
+|---|---|---|---|
+| `stop` | no stop in force | a stop, and since when. Past a day it also reminds you, but it is still a WARN: it was deliberate | the stop file cannot be read, so everything has stopped and nobody chose that. `resume` repairs it |
+| `coordinator` | `/healthz` answers and the service runs | it answers but its service is not loaded, or it disagrees with the stop file about a stop | no answer, or not a healthy one |
+| `helper` | running, and a pass in the last 2 minutes | not installed (this machine may not be a builder) | installed and not loaded or not running, or no recent pass |
+| `reviewer` | running | | not installed, not loaded or not running |
+| `docker` | the daemon answers | | not found, down, or no answer in 15 seconds |
+| `tailscale` | `Running` | | anything else, not found, or stuck |
+| `tailscale-serve` | proxies to the coordinator, tailnet only | | no such proxy, or one **not** marked tailnet only |
+| `tailscale-key` | no expiry, or more than 30 days left | inside 30 days (reminds you), or it cannot be read | expired |
+| `tailscale-login` | `TailscaleStartOnLogin` reads 1 | it reads 0, or cannot be read. What 0 and 1 mean is inferred from the name: Tailscale does not document it | |
+| `disk` | 20 GB free or more | under 20 GB | under 5 GB |
+| `backup` | installed, and `statusProblems` finds nothing | **not installed yet**: nothing has failed, but nothing is being backed up | installed and not loaded, no status, or any problem `backup-service.sh status` would report |
+| `review-queue` | counts, and nothing has waited too long, or a stop or pause explains the wait | something has waited over 2 hours, one gave up in the last day, or the database is busy right now | something has waited over 6 hours, or the database is missing, stuck or broken |
+| `review-pause` | not paused | a usage limit, which lifts by itself | a sign-in failure, which waits for you however long it takes |
+| `logs` | counts and the largest | a symlink, hard link or folder with a log's name was left alone | a log could not be rotated, or the log folder is not a real folder |
+| `health-job` | the job is keeping up | not installed yet. In the job itself, a gap since the last run (asleep or logged out) | installed, and not loaded or more than 45 minutes behind |
+
+**Never stuck.** Every tool has its own short time limit, and each check has one too, so a stuck `docker` or `tailscale` is a FAIL line. A check that breaks is a line, and the rest still report. The checks run together, so one slow check makes no other late. A hard deadline of 2 minutes on its own thread ends a run that is stuck somewhere no timer can reach: launchd never starts a job that is still running, so without this one stuck run would be the last. If that happens the status file stays as it was, and its time shows it.
+
+**Reading `reviewer.db`.** Only with SQLite's read-only flag, in a separate short-lived process, with a 500 ms busy timeout and an 8 second limit overall. It cannot write, cannot create a missing file, and changes no schema. It never uses `ReviewStore`, and it selects only counts, times and the kind of pause. As with the backup job, if nothing else has the database open, SQLite can leave an empty `-wal` and `-shm` beside it. They are harmless.
+
+**The status file** is `~/.adabra-control/health-status.json` (or `ADABRA_HEALTH_STATUS`), beside the stop file, mode 644: agents and a later separate builder user can read it, and `.claude/settings.json` denies agents writing there. It is replaced whole on each run. It holds the lines, their levels, the time, and what has been notified. It never holds a token, the contents of a log, a database's contents, a stop's reason, a tool's output, or the tailnet's name: every line is built from counts, states, dates and fixed words.
+
+```json
+{
+  "version": 1,
+  "at": "2026-11-03T03:15:00.000Z",
+  "next_by": "2026-11-03T04:00:00.000Z",
+  "worst": "FAIL",
+  "counts": { "OK": 13, "WARN": 1, "FAIL": 1 },
+  "simulated": null,
+  "lines": [{ "check": "docker", "level": "FAIL", "state": "down", "detail": "the Docker daemon is not answering, so PRs cannot be tested" }],
+  "alerts": { "docker": { "level": "FAIL", "state": "down", "since": "2026-11-03T03:15:00.000Z", "notified_at": "2026-11-03T03:15:00.000Z" } }
+}
+```
+
+**A dead job.** Nothing can notify you that the job itself has died. `at` is how you tell: past `next_by` (45 minutes), it has stopped. `health`, `health --last` and `health-service.sh status` all say so.
+
+**Notifications don't nag.** What has been said is remembered under `alerts`, in that same file, so it survives restarts and reboots. A FAIL, or a WARN that asks for a reminder, notifies once when it appears and once when its level or state changes. A FAIL still there a day later is raised again, and a reminder a week later. When it clears you are told once, and it is forgotten. All of it goes in one notification per run. If a notification cannot be shown it stays due and is tried on the next run. Losing the file costs one repeat. If the file cannot be written, that is a FAIL of its own and notifies on every run, because nothing else is left to say so.
+
+**If the login session is gone.** LaunchAgents need it, so while nobody is logged in the job does not run and nothing notifies you, which is why the mini must log in automatically. At the next login `RunAtLoad` runs it straight away, and the memory means you only hear what is new. A notification appears on the mini's own screen: it reaches you only if you are looking at the mini, or when you next open Notification Center there.
+
+**Log rotation** is part of the job: the job already runs every 15 minutes, so a runaway log is caught within 15 minutes, and there is no second schedule to keep alive. A problem shows as its own line. Any `~/Library/Logs/adabra-*.log` over 10 MB is copied to `.1` (then `.2` and `.3`, and older ones go) and truncated in place, with no service restarted. launchd holds these files open for the service's whole life, so a rename would only make the service go on writing to the renamed file. Anything written between the last read of the copy and the truncate is lost: at most a line or two, once per rotation, accepted. Modes stay as they were, and the copy gets the log's mode. A symlink is never followed, out of the folder or anywhere else, and a hard link is left alone. These files hold untrusted PR output: they are copied as bytes, and nothing parses or prints them. `health` only reports sizes. Override records go in the reviewer's log, so they eventually roll off with it, after about 40 MB of that log.
+
+**A simulated failure.** This fails one check on paper, through the status file and the notification, and touches no real service. The real probe is not even run. It can only make a check fail, never pass, so it cannot hide anything. It is a flag on one run, and the service has no way to be installed with it.
+
+```bash
+service/health-service.sh drill docker     # exits 1, a notification appears, and the docker line says SIMULATED
+service/ops.sh health --last               # the same result, from the status file
+service/health-service.sh run              # the real job: docker is fine again, so a "recovered" notification appears
+service/ops.sh health --last               # back to how it really is
+```
+
 ## GitHub App instead of personal tokens (Mac mini)
 
 By default each service uses its token file. Set a service's three app settings and it uses short-lived installation tokens

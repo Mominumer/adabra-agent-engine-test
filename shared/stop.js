@@ -52,7 +52,7 @@ export function readStop({ path } = {}) {
 export const isStopped = (options) => readStop(options).stopped;
 
 // Whole or not at all, and on disk before this returns, so a power cut leaves the old state or the new one.
-function writeState(path, state) {
+export function writeState(path, state) {
   const dir = dirname(path);
   // Readable whatever the umask (the README's token steps leave a shell at 077): a health check or another user must be able to read it.
   if (mkdirSync(dir, { recursive: true })) chmodSync(dir, 0o755);
