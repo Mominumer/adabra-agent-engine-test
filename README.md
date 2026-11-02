@@ -476,6 +476,7 @@ service/ops.sh stop --reason "..."           # stop everything, until resume. Wo
 service/ops.sh resume                        # undo it; asks you to type the word
 service/ops.sh status                        # what is in force, and why
 service/ops.sh override <pr> --reason "..."  # adabra/review passes on the PR's current head commit; asks you to type the words
+service/ops.sh switch-stop                   # move the stop to the machine folder, once: see "Moving the stop" below
 ```
 
 **While stopped:**
@@ -488,9 +489,51 @@ service/ops.sh override <pr> --reason "..."  # adabra/review passes on the PR's 
 | Reviewer | Starts nothing and posts nothing, and does not poll. A queued review stays queued and shows `pending`. A running job's container is ended within seconds, nothing about that run is posted, and it goes back to the queue without using up an attempt. Once posting has begun it finishes, so a result is never half-posted. |
 | Overnight runner | Must run `service/ops.sh check` before it starts anything and between steps: exit 0 = go; any other exit = do not start. It prints one line of JSON. From Node: `isStopped()` in `shared/stop.js`. |
 
-**Where it lives.** `~/.adabra-control/stop.json` (or `ADABRA_STOP_FILE`, if you set it for the services too). It belongs to no service, so `stop` works with any of them down, and each one reads it for itself. It is on disk, so a stop survives restarts and reboots. The file and its folder are readable by other users, so never put a secret in a reason. Only a missing file and a well-formed "not stopped" mean running; anything else that cannot be read counts as stopped. `resume` repairs a damaged file. `/healthz` also says `"stopped": true`.
+**Where it lives.** `/opt/adabra-control/stop.json` once that folder exists, so every macOS user on the machine reads the same stop. Until then, `~/.adabra-control/stop.json`, which only its own user can be relied on to reach. `ADABRA_STOP_FILE` wins over both, if you set it for the services too. Each service works out the path on every check. The file belongs to no service, so `stop` works with any of them down. It is on disk, so a stop survives restarts and reboots. The file and its folder are readable by other users, so never put a secret in a reason. `/healthz` also says `"stopped": true`.
+
+**What counts as running.** A well-formed "not stopped", or no file at all when the path is outside the machine folder. Anything else counts as stopped, including no file inside the machine folder, which reads as `the machine-wide stop state is missing`. `resume` repairs a damaged or missing file.
+
+**Who can write it.** `stop` and `resume` write to whichever path is in force, keeping the folder's mode and leaving the file at mode 644. Only the folder's owner can write there. Anyone else can check a stop and not change it: `stop` then prints `STOP DID NOT TAKE EFFECT`, exits 1 and says how to stop the services by hand, and `resume` prints `RESUME FAILED, still stopped`. A file that already counts as stopped stays stopped either way.
+
+**If the machine folder is removed**, the default falls back to the per-user file, where no file reads as running, so leave it in place. A later unattended service must name `/opt/adabra-control/stop.json` in its own settings, pass it to `readStop({ path })`, where a missing file counts as stopped even with the folder gone, and refuse to start if it is missing. Nothing does that yet.
 
 Run `resume` with the coordinator up: a lease that ran out while the coordinator was down is restored only if the coordinator comes back before the resume. `resume` warns you.
+
+### Moving the stop to the machine folder
+
+Do this once, at the mini, from the running checkout with this change pulled, and with no stop in force. Pick a moment when no live check or drill is running, because the restarts below end whatever the reviewer is doing, and a job in progress goes back to the queue.
+
+```bash
+# 1. Must say "Running: no stop in force." If it does not, stop here and deal with that stop first.
+service/ops.sh status
+
+# 2. Put the new code in place. With no machine folder it reads the same file as before, so nothing changes yet.
+launchctl kickstart -k gui/$(id -u)/ai.adabra.coordinator
+launchctl kickstart -k gui/$(id -u)/ai.adabra.reviewer
+service/health-service.sh install
+
+# 3. Checks again, asks you to type the word, then asks for your password. Agents must not run this.
+service/ops.sh switch-stop
+
+# 4. Must say "Running: no stop in force." and "State file: /opt/adabra-control/stop.json".
+service/ops.sh status
+
+# 5. Prove the services follow it. This ends a running review, which goes back to the queue.
+service/ops.sh stop --reason "switch drill"
+curl -s http://127.0.0.1:8787/healthz                  # must say "stopped":true
+tail -n 5 ~/Library/Logs/adabra-reviewer.log           # within seconds: STOPPED by the operator
+service/ops.sh resume
+```
+
+**Why the order matters.**
+
+- **The restarts come first, and once only.** A coordinator or reviewer still running the old code goes on reading the old file, so it would miss every stop written to the new one. If step 5 does not show the stop, that is what happened: restart that service. They need no restart for the switch itself, since they look for the folder on every check. Helpers and the backup job do not read the file.
+- **The health job is reinstalled** because older installs wrote the old stop file into its plist, where it wins over everything. `switch-stop` refuses until that has gone. If you exported other settings for that job, export them again first.
+- **No false stop.** A service that finds the folder with no file in it counts as stopped. So `switch-stop` builds the folder and its file as `/opt/adabra-control.new`, then renames that into place. A service finds either no folder, and reads the old file, or the folder with its file.
+- **No lost stop.** After the switch nothing reads the old file. So `switch-stop` refuses while a stop is in force there, and carries over one that arrives while it runs: it looks again a second after the rename, and every stop after the rename goes to the new file.
+- **Stale checkouts.** `service/ops.sh stop` run from a checkout or worktree that does not have this change writes the old file, and nothing reads that file now. Stop from the running checkout, or from a branch that has this change.
+
+If `switch-stop` fails partway, the services are still on the old file. A leftover `/opt/adabra-control.new` is harmless, and running it again uses it.
 
 **What a stop does not do.** It does not end a builder session already running on someone's machine: the owner is told, and that session can no longer claim or report progress, but it runs until someone ends it. It does not block `git push` or anything else that goes straight to GitHub.
 
@@ -498,7 +541,7 @@ Run `resume` with the coordinator up: a lease that ran out while the coordinator
 
 **Override** acts on the head commit it showed you, looked up again after you confirm. It refuses a closed or merged PR, and refuses while a review of that commit is queued or running, because the result would replace it (a real review waiting out a pause is the exception: see above). It never touches `adabra/tests`, so a PR whose tests failed stays blocked. A new push loses it, because statuses belong to a commit. It leaves a record in `~/Library/Logs/adabra-reviewer.log` (or `REVIEW_LOG_FILE`) before it posts: if it cannot write there, it does not post. It works during a stop, because it is a person's deliberate act and no job is involved.
 
-**Who may run what.** Agents may run `stop`, `status`, `check` and `health`: stopping is the safe direction, and `health` only looks. `resume` and `override` are for a person at the mini, like merging. Both need a terminal and a typed confirmation, and `.claude/settings.json` denies them. **That is a speed bump, not a boundary.** While builder sessions run as the same macOS user as the reviewer, an agent can fake a terminal, edit the state file or read the token or key. Deny rules only bind sessions that load this repo's settings. A hard boundary needs the planned separate builder user.
+**Who may run what.** Agents may run `stop`, `status`, `check` and `health`: stopping is the safe direction, and `health` only looks. `resume`, `override` and `switch-stop` are for a person at the mini, like merging. All three need a terminal and a typed confirmation, and `.claude/settings.json` denies them, along with editing or writing the stop file directly in either place. **That is a speed bump, not a boundary.** While builder sessions run as the same macOS user as the reviewer, an agent can fake a terminal, edit the state file or read the token or key. Deny rules only bind sessions that load this repo's settings. A hard boundary needs the planned separate builder user.
 
 ## Health report and log rotation (Mac mini)
 
@@ -537,7 +580,7 @@ Each line is OK, WARN or FAIL. **A FAIL means someone should act.** A WARN is wo
 
 **Reading `reviewer.db`.** Only with SQLite's read-only flag, in a separate short-lived process, with a 500 ms busy timeout and an 8 second limit overall. It cannot write, cannot create a missing file, and changes no schema. It never uses `ReviewStore`, and it selects only counts, times and the kind of pause. As with the backup job, if nothing else has the database open, SQLite can leave an empty `-wal` and `-shm` beside it. They are harmless.
 
-**The status file** is `~/.adabra-control/health-status.json` (or `ADABRA_HEALTH_STATUS`), beside the stop file, mode 644: agents and a later separate builder user can read it, and `.claude/settings.json` denies agents writing there. It is replaced whole on each run. It holds the lines, their levels, the time, and what has been notified. It never holds a token, the contents of a log, a database's contents, a stop's reason, a tool's output, or the tailnet's name: every line is built from counts, states, dates and fixed words.
+**The status file** is `~/.adabra-control/health-status.json` (or `ADABRA_HEALTH_STATUS`), mode 644, in that one place whichever stop file is in force: it never moves to the machine folder. Agents running as this user can read it, and `.claude/settings.json` denies them writing there. It is replaced whole on each run. It holds the lines, their levels, the time, and what has been notified. It never holds a token, the contents of a log, a database's contents, a stop's reason, a tool's output, or the tailnet's name: every line is built from counts, states, dates and fixed words.
 
 ```json
 {

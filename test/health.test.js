@@ -937,10 +937,45 @@ test('the status file: whole, readable by others, with its time and when the nex
   assert.equal(statSync(dirname(w.statusFile)).mode & 0o777, 0o755);
 });
 
-test('the status file: the default is beside the stop file, outside ~/.adabra', () => {
+test('the status file: one place, in ~/.adabra-control, outside ~/.adabra, and it does not follow the stop file', () => {
   assert.equal(healthStatusPath({}, '/home/x'), '/home/x/.adabra-control/health-status.json');
   assert.equal(healthStatusPath({ ADABRA_HEALTH_STATUS: '/elsewhere/h.json' }, '/home/x'), '/elsewhere/h.json');
   assert.ok(!healthStatusPath({}, '/home/x').includes('.adabra/'));
+  assert.equal(healthStatusPath({ ADABRA_STOP_FILE: '/opt/adabra-control/stop.json' }, '/home/x'), '/home/x/.adabra-control/health-status.json');
+});
+
+test('the machine folder: the job writes to the home folder, never into it, even when it cannot be written; and the stop line reads it', { skip: process.getuid?.() === 0 ? 'root can write anything' : false }, async (t) => {
+  const home = tempDir(t);
+  const machineDir = join(tempDir(t), 'adabra-control');
+  mkdirSync(machineDir, { mode: 0o755 });
+  const machineFile = join(machineDir, 'stop.json');
+
+  const probes = realProbes({ env: { PATH: home }, home, machineDir });
+  const line = () => lineFor('stop', { stop: probes.stop });
+  const missing = await line();
+  assert.equal(missing.level, 'FAIL', 'nobody chose this, it has stopped everything, and someone must look');
+  assert.match(missing.detail, /file missing.*resume repairs it/);
+
+  recordStop({ reason: SECRET, at: new Date(T0 - HOUR), path: machineFile, machineDir });
+  const stopped = await line();
+  assert.equal(stopped.level, 'WARN');
+  assert.ok(!JSON.stringify(stopped).includes(SECRET));
+
+  const said = [];
+  chmodSync(machineDir, 0o555);
+  let code;
+  try {
+    code = await healthCommand({
+      args: ['--job'], env: {}, home, now: () => T0, out: (m) => said.push(m), deadlineMs: 0, notify: async () => true, probes: healthy({ stop: probes.stop }),
+    });
+  } finally {
+    chmodSync(machineDir, 0o755);
+  }
+  assert.equal(code, 0, said.join('\n'));
+  const statusFile = join(home, '.adabra-control', 'health-status.json');
+  assert.equal(JSON.parse(readFileSync(statusFile, 'utf8')).lines.find((l) => l.check === 'stop').level, 'WARN');
+  assert.equal(statSync(statusFile).mode & 0o777, 0o644);
+  assert.deepEqual(readdirSync(machineDir), ['stop.json'], 'nothing of the job\'s beside the stop state');
 });
 
 test('the status file: a broken one costs a repeat and a WARN, and is replaced', async (t) => {
@@ -1460,6 +1495,7 @@ test('service: install writes a 15-minute job that launchd never overlaps or res
   assert.ok(plist.includes(`<string>${join(REPO, 'ops', 'main.js')}</string><string>health</string><string>--job</string>`));
   assert.ok(plist.includes(`<key>REVIEW_DB</key><string>${join(REPO, 'reviewer.db')}</string>`));
   assert.ok(plist.includes(`<key>ADABRA_HEALTH_STATUS</key><string>${join(f.home, '.adabra-control', 'health-status.json')}</string>`));
+  assert.doesNotMatch(plist, /ADABRA_STOP_FILE/, 'a path here would win over the machine folder: each run finds the stop file for itself');
   assert.ok(plist.includes(`<string>${join(f.home, 'Library', 'Logs', 'adabra-health.log')}</string>`));
   assert.match(plist, /<key>PATH<\/key><string>[^<]*\.docker\/bin/);
   assert.doesNotMatch(plist, /simulate/, 'no drill can be left switched on in the service');
@@ -1489,6 +1525,18 @@ test('service: install writes a 15-minute job that launchd never overlaps or res
   assert.equal(existsSync(plistPath), false);
   assert.equal(existsSync(statusFile), true, 'uninstall leaves the status file');
   assert.match(f.run('status').stdout, /service not loaded/);
+});
+
+test('service: a stop file exported on purpose still goes in the plist, and the plist stays valid either way', { ...posixOnly, timeout: 60_000 }, (t) => {
+  const f = fakeService(t);
+  const r = spawnSync(SERVICE, ['install'], { encoding: 'utf8', env: { ...f.env, ADABRA_STOP_FILE: '/somewhere/stop.json' } });
+  assert.equal(r.status, 0, r.stdout + r.stderr);
+  const plistPath = join(f.home, 'Library', 'LaunchAgents', 'ai.adabra.health.plist');
+  assert.ok(readFileSync(plistPath, 'utf8').includes('<key>ADABRA_STOP_FILE</key><string>/somewhere/stop.json</string>'));
+  if (process.platform === 'darwin') {
+    const lint = spawnSync('/usr/bin/plutil', ['-lint', plistPath], { encoding: 'utf8' });
+    assert.equal(lint.status, 0, lint.stdout);
+  }
 });
 
 test('service: follows the shape of its neighbours, and starts nothing it should not', () => {

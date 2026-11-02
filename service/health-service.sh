@@ -12,7 +12,7 @@
 # Settings (override by exporting before `install`, and when running status or drill by hand):
 #   REVIEW_DB             default <repo>/reviewer.db. Opened read-only
 #   ADABRA_BACKUP_STATUS  default ~/Library/Logs/adabra-backup-status.json
-#   ADABRA_STOP_FILE      default ~/.adabra-control/stop.json
+#   ADABRA_STOP_FILE      default unset: each run finds the stop file as every service does. If set it goes in the plist, and wins
 #   ADABRA_HEALTH_STATUS  default ~/.adabra-control/health-status.json
 #   TEAM_AGENT_HOME       default ~/.team-agent. Only agent-status.json is read
 #   COORDINATOR_PORT      default 8787
@@ -29,7 +29,8 @@ case "${1:-}" in
     NODE="$(command -v node)" || { echo "node not found on PATH"; exit 1; }
     REVIEW_DB="${REVIEW_DB:-$REPO_DIR/reviewer.db}"
     ADABRA_BACKUP_STATUS="${ADABRA_BACKUP_STATUS:-$HOME/Library/Logs/adabra-backup-status.json}"
-    ADABRA_STOP_FILE="${ADABRA_STOP_FILE:-$HOME/.adabra-control/stop.json}"
+    STOP_ENV=""
+    [ -z "${ADABRA_STOP_FILE:-}" ] || STOP_ENV="    <key>ADABRA_STOP_FILE</key><string>$ADABRA_STOP_FILE</string>"
     ADABRA_HEALTH_STATUS="${ADABRA_HEALTH_STATUS:-$HOME/.adabra-control/health-status.json}"
     TEAM_AGENT_HOME="${TEAM_AGENT_HOME:-$HOME/.team-agent}"
     COORDINATOR_PORT="${COORDINATOR_PORT:-8787}"
@@ -48,7 +49,7 @@ case "${1:-}" in
   <dict>
     <key>REVIEW_DB</key><string>$REVIEW_DB</string>
     <key>ADABRA_BACKUP_STATUS</key><string>$ADABRA_BACKUP_STATUS</string>
-    <key>ADABRA_STOP_FILE</key><string>$ADABRA_STOP_FILE</string>
+$STOP_ENV
     <key>ADABRA_HEALTH_STATUS</key><string>$ADABRA_HEALTH_STATUS</string>
     <key>TEAM_AGENT_HOME</key><string>$TEAM_AGENT_HOME</string>
     <key>COORDINATOR_PORT</key><string>$COORDINATOR_PORT</string>

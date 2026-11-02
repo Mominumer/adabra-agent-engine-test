@@ -1,36 +1,55 @@
-import { chmodSync, closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, writeSync } from 'node:fs';
+import { chmodSync, closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, writeSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { operatorText, plain } from './sanitize.js';
 
 // The operator's emergency stop is one small file. No service owns it, so it can be set with any service down and each service
 // reads it for itself. It is outside ~/.adabra because agents are denied that folder and a health check must be able to read
 // this. It is on disk, so a stop stays in force across restarts and reboots until someone resumes.
 //
+// There is one for the whole machine once /opt/adabra-control exists. Without it each user would have their own, in a home folder
+// the others may not be able to enter: a process running as anyone else would find no file, read that as running and miss the
+// operator's stop. Which file is in force is worked out on every read, so a process already running this code needs no restart
+// when the folder appears. service/ops.sh switch-stop makes the folder: see the README.
+//
 // Anyone may read it and only its owner may write it: a later separate builder user can check it but not change it. So a reason
 // must never hold a secret.
 //
-// Reading fails safe. Only "no file yet" and a well-formed "not stopped" mean running; anything else counts as stopped.
+// Reading fails safe. A well-formed "not stopped" means running, and so does "no file yet" outside the machine folder, which is a
+// machine with no stop feature set up. Anything else counts as stopped, and that includes no file inside the machine folder.
+//
+// One gap: if the folder is ever removed, the default falls back to the per-user file, where no file reads as running. So a later
+// unattended service must name /opt/adabra-control/stop.json in its own settings, pass that to readStop({ path }), where a missing
+// file counts as stopped with or without the folder, and refuse to start if it is missing. Nothing does that yet.
+//
 // A long-running job (the overnight runner, say) checks before it starts anything and between steps, either way:
 //   service/ops.sh check                    exit 0 = go; any other exit = do not start. Prints one line of JSON.
 //   import { isStopped } from 'shared/stop.js'
 export const RUNNING = Object.freeze({ stopped: false });
 const NO_REASON = 'no reason given';
 const UNREADABLE = 'the stop state could not be read, so everything stays stopped until the operator runs resume';
+const MISSING = 'the machine-wide stop state is missing, so everything stays stopped until the operator runs resume';
 
-export const stopFilePath = (env = process.env, home = homedir) =>
-  env.ADABRA_STOP_FILE?.trim() || join(home(), '.adabra-control', 'stop.json');
+export const MACHINE_DIR = '/opt/adabra-control';
 
-const failSafe = (why) => ({ stopped: true, unreadable: String(why), reason: UNREADABLE, since: null });
+export const perUserStopFile = (home = homedir) => join(home(), '.adabra-control', 'stop.json');
+
+// machineDir is only ever passed by tests, so that nothing they do depends on the real folder.
+export const stopFilePath = (env = process.env, home = homedir, machineDir = MACHINE_DIR) =>
+  env.ADABRA_STOP_FILE?.trim() || (existsSync(machineDir) ? join(machineDir, 'stop.json') : perUserStopFile(home));
+
+const failSafe = (why, reason = UNREADABLE) => ({ stopped: true, unreadable: String(why), reason, since: null });
 const isoOrNull = (v) => (typeof v === 'string' && !Number.isNaN(Date.parse(v)) ? new Date(Date.parse(v)).toISOString() : null);
 
 // Never throws. { stopped: false } or { stopped: true, reason, since, by, from }, plus `unreadable` when it failed safe.
-export function readStop({ path } = {}) {
+export function readStop({ path, machineDir = MACHINE_DIR } = {}) {
+  const file = path ?? stopFilePath(undefined, undefined, machineDir);
   let text;
   try {
-    text = readFileSync(path ?? stopFilePath(), 'utf8');
+    text = readFileSync(file, 'utf8');
   } catch (err) {
-    return err.code === 'ENOENT' ? RUNNING : failSafe(err.code ?? err.message);
+    if (err.code !== 'ENOENT') return failSafe(err.code ?? err.message);
+    return dirname(resolve(file)) === resolve(machineDir) ? failSafe('file missing', MISSING) : RUNNING;
   }
   let s;
   try {
@@ -82,18 +101,18 @@ export function writeState(path, state) {
 
 // A stop already in force is left alone, so a second caller cannot rewrite the first one's reason or when it began.
 // A file that cannot be read is replaced: that is the one case where writing a good state helps.
-export function recordStop({ reason, by = '', from = '', at = new Date(), path = stopFilePath() } = {}) {
-  const current = readStop({ path });
+export function recordStop({ reason, by = '', from = '', at = new Date(), machineDir = MACHINE_DIR, path = stopFilePath(undefined, undefined, machineDir) } = {}) {
+  const current = readStop({ path, machineDir });
   if (current.stopped && !current.unreadable) return { already: true, state: current };
   writeState(path, { stopped: true, reason: operatorText(reason) || NO_REASON, since: at.toISOString(), by, from });
-  return { already: false, state: readStop({ path }) };
+  return { already: false, state: readStop({ path, machineDir }) };
 }
 
-export function recordResume({ at = new Date(), path = stopFilePath() } = {}) {
-  const current = readStop({ path });
+export function recordResume({ at = new Date(), machineDir = MACHINE_DIR, path = stopFilePath(undefined, undefined, machineDir) } = {}) {
+  const current = readStop({ path, machineDir });
   const last = current.stopped ? { reason: current.reason, since: current.since, resumed_at: at.toISOString() } : (current.last_stop ?? null);
   writeState(path, { stopped: false, last_stop: last });
-  return readStop({ path });
+  return readStop({ path, machineDir });
 }
 
 // What a builder is told, whatever came down the wire: never more than this, and never the file's path.

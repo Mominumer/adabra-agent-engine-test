@@ -9,7 +9,7 @@ import { Worker } from 'node:worker_threads';
 import { backupConfig, readStatus, statusProblems } from '../backup/backup.js';
 import { notifyCommand } from '../helper/platform.js';
 import { plain } from '../shared/sanitize.js';
-import { readStop, stopFilePath, writeState } from '../shared/stop.js';
+import { MACHINE_DIR, readStop, stopFilePath, writeState } from '../shared/stop.js';
 import { rotateLogs, scanLogs } from './rotate-logs.js';
 
 // The health report. `health` only looks: it starts nothing, writes nothing and rotates nothing, so agents may run it. `health --job` is
@@ -163,7 +163,7 @@ export function parseServe(output, port) {
   return mine.every((b) => /\(tailnet only\)/i.test(b.head)) ? 'tailnet' : 'public';
 }
 
-export function realProbes({ env = process.env, home = homedir(), repoDir = REPO_DIR, uid = process.getuid?.() ?? 0, tool = runTool } = {}) {
+export function realProbes({ env = process.env, home = homedir(), repoDir = REPO_DIR, uid = process.getuid?.() ?? 0, tool = runTool, machineDir = MACHINE_DIR } = {}) {
   const run = (file, args, timeoutMs) => tool(file, args, { env, timeoutMs });
   const cfg = backupConfig({ env, home, repoDir });
   const reviewDb = cfg.databases.find((d) => d.name === 'reviewer').path;
@@ -172,7 +172,7 @@ export function realProbes({ env = process.env, home = homedir(), repoDir = REPO
   const statusFile = healthStatusPath(env, home);
   const tailscale = env.ADABRA_TAILSCALE?.trim() || (existsSync(TAILSCALE_APP) ? TAILSCALE_APP : 'tailscale');
   return {
-    stop: () => readStop({ path: stopFilePath(env, () => home) }),
+    stop: () => readStop({ path: stopFilePath(env, () => home, machineDir), machineDir }),
     service: async (label) => ({
       installed: existsSync(join(home, 'Library', 'LaunchAgents', `${label}.plist`)),
       ...parseLaunchctl(await run('launchctl', ['print', `gui/${uid}/${label}`], LAUNCHCTL_MS)),
@@ -538,8 +538,9 @@ export function realNotify({ env = process.env, platform = process.platform, too
 }
 
 // --- the status file ---------------------------------------------------------
-// Replaced whole (shared/stop.js: temp, fsync, rename), mode 644, beside the stop file: readable by agents, and by a later separate
-// builder user, and not in ~/.adabra. Lines, levels, times and states only: a reader can trust there is nothing else in it.
+// Replaced whole (shared/stop.js: temp, fsync, rename), mode 644, in ~/.adabra-control whichever stop file is in force: this user's own
+// job writing its own file, never into the machine folder beside the stop state. Readable by agents running as this user, and not in
+// ~/.adabra. Lines, levels, times and states only: a reader can trust there is nothing else in it.
 export function readLastStatus(path) {
   let s;
   try {

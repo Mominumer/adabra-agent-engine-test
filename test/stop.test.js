@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import { execFile, spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PassThrough } from 'node:stream';
@@ -22,9 +22,9 @@ import { CONTEXTS, Dispatcher } from '../reviewer/dispatcher.js';
 import { ReviewGitHub } from '../reviewer/github.js';
 import { buildResult, deliverResults, startTaskResults } from '../reviewer/task-results.js';
 import { OVERRIDE_TEXT, overrideCommand, overrideLogPath, parseOverride, runOverride } from '../reviewer/override.js';
-import { checkCommand, EXIT_STOPPED, resumeCommand, statusCommand, stopCommand } from '../ops/commands.js';
+import { checkCommand, EXIT_STOPPED, resumeCommand, statusCommand, stopCommand, switchStopCommand } from '../ops/commands.js';
 import { operatorText } from '../shared/sanitize.js';
-import { isStopped, readStop, recordResume, recordStop, RUNNING, stopFilePath, stopLine, watchStop } from '../shared/stop.js';
+import { isStopped, MACHINE_DIR, perUserStopFile, readStop, recordResume, recordStop, RUNNING, stopBrief, stopFilePath, stopLine, watchStop, writeState } from '../shared/stop.js';
 import { hasTerminal, typed } from '../shared/terminal.js';
 
 // Everything here uses temp directories, ephemeral ports and fakes. Nothing opens a real database, stop file, token or Docker.
@@ -115,10 +115,448 @@ test('the check fails safe when the file cannot be opened', { skip: process.getu
   assert.equal(readStop({ path }).unreadable, 'EACCES');
 });
 
-test('the default place is outside ~/.adabra, and the environment can move it', () => {
-  assert.equal(stopFilePath({}, () => '/home/x'), join('/home/x', '.adabra-control', 'stop.json'));
-  assert.equal(stopFilePath({ ADABRA_STOP_FILE: '/tmp/y' }, () => '/home/x'), '/tmp/y');
-  assert.doesNotMatch(stopFilePath({}, () => '/home/x'), /\.adabra\//);
+test('the default place is outside ~/.adabra, and the environment can move it', (t) => {
+  const absent = join(tempDir(t), 'no-machine-folder');
+  assert.equal(stopFilePath({}, () => '/home/x', absent), join('/home/x', '.adabra-control', 'stop.json'));
+  assert.equal(stopFilePath({ ADABRA_STOP_FILE: '/tmp/y' }, () => '/home/x', absent), '/tmp/y');
+  assert.doesNotMatch(stopFilePath({}, () => '/home/x', absent), /\.adabra\//);
+});
+
+// --- the machine folder -----------------------------------------------------------------------------------------------
+// The folder is always one made here. Nothing below looks at the real one, and the only thing that names it is the constant.
+
+function machineFolder(t, { make = true } = {}) {
+  const dir = join(tempDir(t), 'adabra-control');
+  if (make) mkdirSync(dir, { mode: 0o755 });
+  return { dir, file: join(dir, 'stop.json') };
+}
+const asHome = (home) => () => home;
+
+test('the machine folder: this is the real place, and the path follows the folder from one read to the next', (t) => {
+  assert.equal(MACHINE_DIR, '/opt/adabra-control');
+  const { dir, file } = machineFolder(t, { make: false });
+  assert.equal(stopFilePath({}, asHome('/home/x'), dir), perUserStopFile(asHome('/home/x')));
+  mkdirSync(dir);
+  assert.equal(stopFilePath({}, asHome('/home/x'), dir), file);
+  rmSync(dir, { recursive: true });
+  assert.equal(stopFilePath({}, asHome('/home/x'), dir), perUserStopFile(asHome('/home/x')), 'nothing is remembered');
+});
+
+test('the machine folder with a file in it: says what the file says', (t) => {
+  const { dir, file } = machineFolder(t);
+  const path = stopFilePath({}, asHome('/home/x'), dir);
+  assert.equal(path, file);
+  writeState(file, { stopped: false, last_stop: null });
+  assert.equal(readStop({ path, machineDir: dir }).stopped, false);
+  assert.equal(readStop({ path, machineDir: dir }).unreadable, undefined);
+  writeState(file, { stopped: true, reason: 'drill', since: new Date(1000).toISOString() });
+  const s = readStop({ path, machineDir: dir });
+  assert.equal(s.stopped, true);
+  assert.equal(s.reason, 'drill');
+  assert.equal(s.unreadable, undefined);
+});
+
+test('the machine folder with no file in it: counts as stopped, says why, and gives a builder no path', (t) => {
+  const { dir, file } = machineFolder(t);
+  const s = readStop({ path: stopFilePath({}, asHome('/home/x'), dir), machineDir: dir });
+  assert.equal(s.stopped, true);
+  assert.equal(s.unreadable, 'file missing');
+  assert.match(s.reason, /machine-wide stop state is missing/);
+  assert.match(s.reason, /until the operator runs resume/);
+  assert.equal(s.since, null);
+  assert.doesNotMatch(JSON.stringify(stopBrief(s)), /stop\.json|adabra-control/);
+  const said = [];
+  assert.equal(checkCommand({ path: file, machineDir: dir, say: (m) => said.push(m) }), EXIT_STOPPED);
+  assert.equal(JSON.parse(said[0]).unreadable, 'file missing');
+});
+
+test('no machine folder: as before, no file reads as running, on the per-user path', (t) => {
+  const { dir } = machineFolder(t, { make: false });
+  const home = tempDir(t);
+  const path = stopFilePath({}, asHome(home), dir);
+  assert.equal(path, join(home, '.adabra-control', 'stop.json'));
+  assert.deepEqual(readStop({ path, machineDir: dir }), RUNNING);
+  recordStop({ reason: 'mine', path, machineDir: dir });
+  assert.equal(readStop({ path, machineDir: dir }).reason, 'mine');
+});
+
+test('a service that names the machine path itself stays stopped if the whole folder goes', (t) => {
+  const { dir, file } = machineFolder(t, { make: false });
+  assert.equal(existsSync(dir), false);
+  assert.equal(readStop({ path: file, machineDir: dir }).stopped, true);
+  assert.equal(readStop({ path: file, machineDir: dir }).unreadable, 'file missing');
+  assert.equal(readStop({ path: join(dir, '.', 'stop.json'), machineDir: `${dir}/` }).stopped, true, 'however the two are spelled');
+  assert.deepEqual(readStop({ path: join(dir, 'elsewhere', 'stop.json'), machineDir: dir }), RUNNING, 'only the file directly in the folder');
+});
+
+test('ADABRA_STOP_FILE wins over the machine folder and the per-user file, and a missing file there is not the machine file', (t) => {
+  const { dir, file } = machineFolder(t);
+  writeState(file, { stopped: true, reason: 'the machine says stop', since: null });
+  const mine = join(tempDir(t), 'stop.json');
+  const path = stopFilePath({ ADABRA_STOP_FILE: mine }, asHome('/home/x'), dir);
+  assert.equal(path, mine);
+  assert.deepEqual(readStop({ path, machineDir: dir }), RUNNING);
+  assert.equal(stopFilePath({ ADABRA_STOP_FILE: '  ' }, asHome('/home/x'), dir), file, 'blank is not set');
+});
+
+test('a different home with the same machine folder sees the same state: the point of the change', (t) => {
+  const { dir } = machineFolder(t);
+  const [operator, other] = [tempDir(t), tempDir(t)];
+  const read = (home) => readStop({ path: stopFilePath({}, asHome(home), dir), machineDir: dir });
+  recordResume({ path: stopFilePath({}, asHome(operator), dir), machineDir: dir });
+  assert.equal(read(other).stopped, false);
+  recordStop({ reason: 'from the operator', path: stopFilePath({}, asHome(operator), dir), machineDir: dir });
+  assert.equal(read(other).stopped, true);
+  assert.equal(read(other).reason, 'from the operator');
+  assert.equal(existsSync(join(other, '.adabra-control')), false, 'no file of its own was needed');
+
+  // Without the folder, this is what went wrong: the other user finds no file and reads that as running.
+  const none = join(tempDir(t), 'no-machine-folder');
+  recordStop({ reason: 'from the operator', path: stopFilePath({}, asHome(operator), none), machineDir: none });
+  assert.deepEqual(readStop({ path: stopFilePath({}, asHome(other), none), machineDir: none }), RUNNING);
+});
+
+test('stop and resume go through the machine path, and repair a missing file there', async (t) => {
+  const { dir, file } = machineFolder(t);
+  const home = tempDir(t);
+  const said = [];
+  const say = (m) => said.push(m);
+  const path = stopFilePath({}, asHome(home), dir);
+  const on = { path, machineDir: dir, say };
+  const resume = () => resumeCommand({ ...on, terminal: true, coordinatorUp: async () => true, confirm: async () => true });
+
+  assert.equal(statusCommand(on), 0);
+  assert.match(said.join('\n'), /could not be read: file missing/);
+  assert.equal(await resume(), 0);
+  assert.equal(readStop({ path: file, machineDir: dir }).stopped, false, 'resume repairs a missing file');
+  assert.match(readFileSync(file, 'utf8'), /machine-wide stop state is missing/, 'and the record says what it was');
+
+  assert.equal(stopCommand({ ...on, terminal: false, args: ['--reason', 'a drill'] }), 0);
+  assert.equal(readStop({ path: file, machineDir: dir }).reason, 'a drill');
+  assert.equal(checkCommand(on), EXIT_STOPPED);
+  assert.equal(await resume(), 0);
+  assert.equal(checkCommand(on), 0);
+  assert.equal(existsSync(join(home, '.adabra-control')), false, 'nothing went to the per-user folder');
+  said.length = 0;
+  statusCommand(on);
+  assert.ok(said.includes(`  State file: ${file}`));
+
+  rmSync(file);
+  assert.equal(stopCommand({ ...on, terminal: false, args: ['--reason', 'after it went'] }), 0);
+  assert.equal(readStop({ path: file, machineDir: dir }).reason, 'after it went', 'a stop replaces a missing file, so its reason shows');
+});
+
+test('writing leaves an existing folder as it was, and the state readable by others, whatever the umask', (t) => {
+  for (const mode of [0o755, 0o775, 0o750]) {
+    const { dir, file } = machineFolder(t);
+    chmodSync(dir, mode);
+    const old = process.umask(0o077);
+    try {
+      recordStop({ reason: 'x', path: file, machineDir: dir });
+      assert.equal(statSync(dir).mode & 0o777, mode);
+      assert.equal(statSync(file).mode & 0o777, 0o644);
+      recordResume({ path: file, machineDir: dir });
+      assert.equal(statSync(dir).mode & 0o777, mode);
+      assert.equal(statSync(file).mode & 0o777, 0o644);
+    } finally {
+      process.umask(old);
+    }
+    assert.deepEqual(readdirSync(dir), ['stop.json'], 'no temp file left');
+  }
+});
+
+const notRoot = { skip: process.getuid?.() === 0 ? 'root can open anything' : false };
+
+// Puts the mode back whatever happens, so the temp folder can always be cleared away.
+async function withMode(dir, mode, fn) {
+  chmodSync(dir, mode);
+  try {
+    return await fn();
+  } finally {
+    chmodSync(dir, 0o755);
+  }
+}
+
+test('a machine file or folder that cannot be opened counts as stopped', notRoot, async (t) => {
+  const { dir, file } = machineFolder(t);
+  recordResume({ path: file, machineDir: dir });
+  chmodSync(file, 0o000);
+  assert.equal(readStop({ path: file, machineDir: dir }).unreadable, 'EACCES');
+  assert.match(readStop({ path: file, machineDir: dir }).reason, /could not be read/);
+  chmodSync(file, 0o644);
+  await withMode(dir, 0o000, () => {
+    assert.equal(stopFilePath({}, asHome('/home/x'), dir), file, 'a folder this user cannot enter is still there');
+    assert.equal(readStop({ path: file, machineDir: dir }).unreadable, 'EACCES');
+  });
+});
+
+test('something else in the folder\'s place counts as stopped, rather than falling back', (t) => {
+  const { dir, file } = machineFolder(t, { make: false });
+  mkdirSync(join(dir, '..'), { recursive: true });
+  writeFileSync(dir, 'not a folder');
+  const path = stopFilePath({}, asHome('/home/x'), dir);
+  assert.equal(path, file);
+  assert.equal(readStop({ path, machineDir: dir }).unreadable, 'ENOTDIR');
+});
+
+test('a folder this user cannot write: stop and resume say so plainly, and nothing reads as more running than it was', notRoot, async (t) => {
+  const { dir, file } = machineFolder(t);
+  const said = [];
+  const say = (m) => said.push(m);
+  const on = { path: file, machineDir: dir, say };
+
+  // Running, and it cannot be stopped from here: that must be loud, and not a success.
+  writeState(file, { stopped: false, last_stop: null });
+  await withMode(dir, 0o555, () => {
+    assert.equal(stopCommand({ ...on, terminal: false }), 1);
+    assert.match(said.join('\n'), /STOP DID NOT TAKE EFFECT: could not write .*EACCES/);
+    assert.match(said.join('\n'), /launchctl bootout/);
+    assert.equal(readStop({ path: file, machineDir: dir }).stopped, false);
+  });
+
+  // Stopped, and it cannot be lifted from here: it stays stopped.
+  recordStop({ reason: 'held', path: file, machineDir: dir });
+  said.length = 0;
+  await withMode(dir, 0o555, async () => {
+    assert.equal(await resumeCommand({ ...on, terminal: true, coordinatorUp: async () => true, confirm: async () => true }), 1);
+    assert.match(said.join('\n'), /RESUME FAILED, still stopped: could not write .*EACCES/);
+    assert.equal(readStop({ path: file, machineDir: dir }).reason, 'held');
+  });
+
+  // Missing and cannot be written: it already counts as stopped, so a stop has done what it was asked to.
+  rmSync(file);
+  said.length = 0;
+  await withMode(dir, 0o555, () => {
+    assert.equal(stopCommand({ ...on, terminal: false }), 0);
+    assert.match(said.join('\n'), /already counts as stopped/);
+  });
+});
+
+// --- moving to the machine folder -------------------------------------------------------------------------------------
+// sudo is always this stand-in. It does what the two real commands do, in temp folders, and nothing here can call the real one.
+
+function switching(t, over = {}) {
+  const base = tempDir(t);
+  const machineDir = join(base, 'adabra-control');
+  const home = tempDir(t);
+  const oldFile = perUserStopFile(asHome(home));
+  const said = [];
+  const sudoCalls = [];
+  const seen = []; // what a service would have read, at every step
+  const look = () => seen.push(readStop({ path: stopFilePath({}, asHome(home), machineDir), machineDir }));
+  const sudo = (args) => {
+    sudoCalls.push(args);
+    look();
+    if (args[0] === 'install') {
+      mkdirSync(args.at(-1), { recursive: true });
+      chmodSync(args.at(-1), 0o755);
+    } else {
+      renameSync(args[1], args[2]);
+    }
+    look();
+    return true;
+  };
+  const run = (more = {}) => switchStopCommand({
+    env: {}, home: asHome(home), machineDir, terminal: true, confirm: async () => true, sudo, user: 'operator', say: (m) => said.push(m), settleMs: 0, ...over, ...more,
+  });
+  return { base, machineDir, machineFile: join(machineDir, 'stop.json'), temp: `${machineDir}.new`, home, oldFile, said, sudoCalls, seen, look, sudo, run };
+}
+
+test('switch-stop: the folder appears with its file, so no service ever reads a false stop, and the last stop comes with it', async (t) => {
+  const w = switching(t);
+  recordStop({ reason: 'earlier', at: new Date(1000), path: w.oldFile, machineDir: w.machineDir });
+  recordResume({ at: new Date(2000), path: w.oldFile, machineDir: w.machineDir });
+  w.look();
+  assert.equal(await w.run(), 0);
+  w.look();
+
+  assert.deepEqual(w.sudoCalls, [
+    ['install', '-d', '-o', 'operator', '-g', 'wheel', '-m', '755', w.temp],
+    ['mv', w.temp, w.machineDir],
+  ]);
+  assert.ok(w.seen.length >= 6);
+  assert.ok(w.seen.every((s) => s.stopped === false), 'running at every step, before, during and after');
+  assert.equal(existsSync(w.temp), false);
+  assert.deepEqual(readdirSync(w.machineDir), ['stop.json']);
+  assert.equal(statSync(w.machineDir).mode & 0o777, 0o755);
+  assert.equal(statSync(w.machineFile).mode & 0o777, 0o644);
+  const after = readStop({ path: w.machineFile, machineDir: w.machineDir });
+  assert.equal(after.stopped, false);
+  assert.equal(after.last_stop.reason, 'earlier');
+  assert.equal(stopFilePath({}, asHome(w.home), w.machineDir), w.machineFile);
+  assert.match(w.said.join('\n'), /Running: no stop in force/);
+  assert.ok(w.said.includes(`  State file: ${w.machineFile}`));
+});
+
+test('switch-stop: with no per-user file at all, it starts from running', async (t) => {
+  const w = switching(t);
+  assert.equal(await w.run(), 0);
+  const after = readStop({ path: w.machineFile, machineDir: w.machineDir });
+  assert.equal(after.stopped, false);
+  assert.equal(after.last_stop, null);
+});
+
+test('switch-stop: refuses while a stop is in force, and touches nothing', async (t) => {
+  const w = switching(t);
+  recordStop({ reason: 'real emergency', path: w.oldFile, machineDir: w.machineDir });
+  const asked = [];
+  assert.equal(await w.run({ confirm: async () => (asked.push(1), true) }), 1);
+  assert.match(w.said.join('\n'), /STOPPED by the operator.*real emergency/);
+  assert.match(w.said.join('\n'), /would leave it behind/);
+  assert.deepEqual(w.sudoCalls, []);
+  assert.deepEqual(asked, []);
+  assert.equal(existsSync(w.machineDir), false);
+  assert.equal(readStop({ path: stopFilePath({}, asHome(w.home), w.machineDir), machineDir: w.machineDir }).reason, 'real emergency', 'still in force');
+
+  writeFileSync(w.oldFile, 'garbage');
+  w.said.length = 0;
+  assert.equal(await w.run(), 1, 'one that cannot be read counts too');
+  assert.deepEqual(w.sudoCalls, []);
+});
+
+for (const [when, stage] of [['while the folder is being made', 'install'], ['just before the rename', 'mv']]) {
+  test(`switch-stop: a stop that arrives ${when} is carried over, with its reason and time, and services then see it`, async (t) => {
+    const w = switching(t);
+    const since = new Date(5000);
+    const sudo = (args) => {
+      if (args[0] === stage) recordStop({ reason: 'mid-switch', by: 'an-agent', from: 'no terminal', at: since, path: w.oldFile, machineDir: w.machineDir });
+      return w.sudo(args);
+    };
+    assert.equal(await w.run({ sudo }), 0);
+    const s = readStop({ path: stopFilePath({}, asHome(w.home), w.machineDir), machineDir: w.machineDir });
+    assert.equal(s.stopped, true);
+    assert.equal(s.reason, 'mid-switch');
+    assert.equal(s.since, since.toISOString());
+    assert.equal(s.by, 'an-agent');
+    assert.match(w.said.join('\n'), /carried over/);
+    assert.match(w.said.join('\n'), /STOPPED by the operator/);
+  });
+}
+
+test('switch-stop: a stop whose command chose the old file just before the rename is caught, because it waits before the last look', async (t) => {
+  const w = switching(t);
+  const sudo = (args) => {
+    const ok = w.sudo(args);
+    if (args[0] === 'mv') setTimeout(() => recordStop({ reason: 'straggler', path: w.oldFile, machineDir: w.machineDir }), 10);
+    return ok;
+  };
+  assert.equal(await w.run({ sudo, settleMs: 200 }), 0);
+  assert.equal(readStop({ path: w.machineFile, machineDir: w.machineDir }).reason, 'straggler');
+});
+
+test('switch-stop: refuses with no terminal, and when the word is wrong, and nothing has happened', async (t) => {
+  const w = switching(t);
+  assert.equal(await w.run({ terminal: false }), 2);
+  assert.match(w.said.join('\n'), /needs an interactive terminal/);
+  assert.equal(await w.run({ confirm: async (_q, expected) => (assert.equal(expected, 'switch'), false) }), 1);
+  assert.deepEqual(w.sudoCalls, []);
+  assert.equal(existsSync(w.machineDir), false);
+});
+
+test('switch-stop: refuses when ADABRA_STOP_FILE or the health job would still point somewhere else', async (t) => {
+  const w = switching(t);
+  assert.equal(await w.run({ env: { ADABRA_STOP_FILE: '/tmp/y' } }), 1);
+  assert.match(w.said.join('\n'), /wins over the machine folder/);
+
+  const plist = join(w.home, 'Library', 'LaunchAgents', 'ai.adabra.health.plist');
+  mkdirSync(join(plist, '..'), { recursive: true });
+  writeFileSync(plist, '<key>ADABRA_STOP_FILE</key><string>/home/x/.adabra-control/stop.json</string>');
+  w.said.length = 0;
+  assert.equal(await w.run(), 1);
+  assert.match(w.said.join('\n'), /health-service\.sh install/);
+  assert.deepEqual(w.sudoCalls, []);
+
+  writeFileSync(plist, '<key>ADABRA_HEALTH_STATUS</key><string>/home/x/.adabra-control/health-status.json</string>');
+  assert.equal(await w.run(), 0);
+});
+
+test('switch-stop: already done, it changes nothing, whatever the old file says', async (t) => {
+  const w = switching(t);
+  assert.equal(await w.run(), 0);
+  recordStop({ reason: 'on the new file', path: w.machineFile, machineDir: w.machineDir });
+  const before = readFileSync(w.machineFile, 'utf8');
+  w.sudoCalls.length = 0;
+  w.said.length = 0;
+  assert.equal(await w.run(), 0);
+  assert.match(w.said[0], /Already switched/);
+  assert.deepEqual(w.sudoCalls, []);
+  assert.equal(readFileSync(w.machineFile, 'utf8'), before);
+});
+
+test('switch-stop: a failed step leaves services on the old file, any stop there holding, and it can be run again', async (t) => {
+  const w = switching(t);
+  const read = () => readStop({ path: stopFilePath({}, asHome(w.home), w.machineDir), machineDir: w.machineDir });
+  assert.equal(await w.run({ sudo: () => false }), 1);
+  assert.match(w.said.join('\n'), /SWITCH FAILED: could not create/);
+  assert.equal(existsSync(w.machineDir), false);
+  assert.equal(read().stopped, false);
+
+  assert.equal(await w.run({ sudo: (args) => (args[0] === 'mv' ? false : w.sudo(args)) }), 1);
+  assert.match(w.said.join('\n'), /SWITCH FAILED: could not move/);
+  assert.equal(existsSync(w.machineDir), false);
+  assert.equal(existsSync(w.temp), true, 'a leftover temporary folder');
+  assert.equal(read().stopped, false, 'and no service looks at it');
+
+  assert.equal(await w.run(), 0, 'running it again uses the leftover');
+  assert.equal(existsSync(w.temp), false);
+  assert.equal(read().stopped, false);
+  assert.equal(stopFilePath({}, asHome(w.home), w.machineDir), w.machineFile);
+});
+
+test('switch-stop: the real command refuses headless before it looks at anything', async (t) => {
+  const r = await cli(['ops/main.js', 'switch-stop'], { ADABRA_STOP_FILE: stopFile(t) });
+  assert.equal(r.code, 2);
+  assert.match(r.out, /needs an interactive terminal/);
+  const sh = await run('bash', [repo('service/ops.sh'), 'switch-stop'], { cwd: tmpdir() }).then(() => 0, (e) => e.code);
+  assert.equal(sh, 2);
+});
+
+test('nothing here but the switch can reach sudo, and that only from a terminal', () => {
+  assert.doesNotMatch(readFileSync(repo('shared/stop.js'), 'utf8'), /sudo|spawn/);
+  assert.doesNotMatch(readFileSync(repo('service/ops.sh'), 'utf8').split('\n').filter((l) => !l.startsWith('#')).join('\n'), /sudo/);
+  const source = readFileSync(repo('ops/commands.js'), 'utf8');
+  assert.equal(source.match(/spawnSync\(/g).length, 1);
+});
+
+test('every long-running reader works out the path on each read: nothing is kept', () => {
+  const stop = readFileSync(repo('shared/stop.js'), 'utf8');
+  assert.match(stop, /const file = path \?\? stopFilePath\(undefined, undefined, machineDir\);/);
+  assert.match(readFileSync(repo('coordinator/main.js'), 'utf8'), /stopState: readStop/);
+  assert.match(readFileSync(repo('coordinator/stop-keeper.js'), 'utf8'), /read = readStop/);
+  assert.match(readFileSync(repo('reviewer/main.js'), 'utf8'), /authors, log, linkTasks, isStopped,/);
+  for (const file of ['coordinator/main.js', 'coordinator/server.js', 'coordinator/worker.js', 'reviewer/main.js', 'reviewer/dispatcher.js', 'reviewer/task-results.js', 'reviewer/paid-tools.js']) {
+    assert.doesNotMatch(readFileSync(repo(file), 'utf8'), /stopFilePath|readStop\(\{ path/, `${file} must not hold a path of its own`);
+  }
+});
+
+// A running coordinator's own reader, in the order the switch happens, with a real server: the folder appears and it follows, unrestarted.
+test('a running coordinator follows the folder with no restart: same server, old file, then the machine file', async (t) => {
+  const { dir, file } = machineFolder(t, { make: false });
+  const home = tempDir(t);
+  const store = new Store(join(tempDir(t), 'coord.db'));
+  const read = () => readStop({ path: stopFilePath({}, asHome(home), dir), machineDir: dir });
+  const server = createServer({ store, stopState: read });
+  const port = await new Promise((r) => server.listen(0, '127.0.0.1', () => r(server.address().port)));
+  t.after(async () => {
+    server.closeAllConnections?.();
+    await new Promise((r) => server.close(r));
+    store.close();
+  });
+  const health = async () => (await fetch(`http://127.0.0.1:${port}/healthz`)).json();
+  assert.deepEqual(await health(), { ok: true });
+
+  const temp = `${dir}.new`;
+  mkdirSync(temp);
+  writeState(join(temp, 'stop.json'), { stopped: false, last_stop: null });
+  renameSync(temp, dir);
+  assert.deepEqual(await health(), { ok: true });
+
+  recordStop({ reason: 'x', path: file, machineDir: dir });
+  assert.deepEqual(await health(), { ok: true, stopped: true });
+  recordResume({ path: file, machineDir: dir });
+  assert.deepEqual(await health(), { ok: true });
+  rmSync(file);
+  assert.deepEqual(await health(), { ok: true, stopped: true }, 'and fails safe if the file goes');
 });
 
 test('a reason is plain text everywhere, however it got into the file', (t) => {
@@ -270,12 +708,23 @@ test('the typed confirmation: exact words only, and end of input is a no', async
 
 test('the deny rules forbid override and resume, allow stop and status, and the shell entry point works', async (t) => {
   const { deny, allow } = JSON.parse(readFileSync(repo('.claude/settings.json'), 'utf8')).permissions;
-  for (const rule of ['Bash(*main.js override*)', 'Bash(*ops.sh override*)', 'Bash(*main.js resume*)', 'Bash(*ops.sh resume*)', 'Edit(~/.adabra-control/**)', 'Write(~/.adabra-control/**)']) {
+  for (const rule of [
+    'Bash(*main.js override*)', 'Bash(*ops.sh override*)', 'Bash(*main.js resume*)', 'Bash(*ops.sh resume*)', 'Bash(*main.js switch-stop*)', 'Bash(*ops.sh switch-stop*)',
+    'Edit(~/.adabra-control/**)', 'Write(~/.adabra-control/**)', 'Edit(//opt/adabra-control/**)', 'Write(//opt/adabra-control/**)',
+  ]) {
     assert.ok(deny.includes(rule), rule);
   }
-  assert.equal(allow.filter((r) => /override|resume/.test(r)).length, 0);
+  assert.equal(allow.filter((r) => /override|resume|switch-stop/.test(r)).length, 0);
   assert.ok(allow.includes('Bash(service/ops.sh stop:*)'));
   assert.ok(allow.includes('Bash(service/ops.sh check)'));
+
+  // The shell rules name the folder by a part of its name, so they already reach the machine path. Written out, in case they are ever narrowed.
+  const bashRules = deny.filter((r) => r.startsWith('Bash(')).map((r) => new RegExp(`^${r.slice(5, -1).replace(/[.+?^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*')}$`));
+  const denied = (command) => bashRules.some((re) => re.test(command));
+  for (const command of ['rm /opt/adabra-control/stop.json', 'rm -rf /opt/adabra-control', 'mv /opt/adabra-control /tmp/x', 'mv x /opt/adabra-control/stop.json', 'echo x > /opt/adabra-control/stop.json', 'echo x >> /opt/adabra-control/stop.json']) {
+    assert.ok(denied(command), command);
+  }
+  assert.ok(!denied('service/ops.sh stop --reason x'), 'stopping stays allowed');
 
   const env = { ...process.env, ADABRA_STOP_FILE: stopFile(t) };
   const sh = (...args) => run('bash', [repo('service/ops.sh'), ...args], { env, cwd: tmpdir() }).then(() => 0, (e) => e.code);
