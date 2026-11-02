@@ -11,6 +11,8 @@
 #   REVIEW_TOKEN_FILE   default ~/.adabra/review-token (the reviewer's own token, not the coordinator's)
 #   REVIEW_AUTHORS      required: comma-separated GitHub logins whose PRs may run on the mini
 #   REVIEW_DB           default <repo>/reviewer.db
+#   REVIEW_IMAGE        default node:26-slim (pull it first; pin by digest)
+#   REVIEW_TEST_CMD     default npm test
 set -euo pipefail
 
 LABEL="ai.adabra.reviewer"
@@ -25,6 +27,8 @@ case "${1:-}" in
     GITHUB_REPO="${GITHUB_REPO:-Mominumer/adabra-agent-engine-test}"
     REVIEW_TOKEN_FILE="${REVIEW_TOKEN_FILE:-$HOME/.adabra/review-token}"
     REVIEW_DB="${REVIEW_DB:-$REPO_DIR/reviewer.db}"
+    REVIEW_IMAGE="${REVIEW_IMAGE:-node:26-slim}"
+    REVIEW_TEST_CMD="${REVIEW_TEST_CMD:-npm test}"
     [ -n "${REVIEW_AUTHORS:-}" ] || { echo "set REVIEW_AUTHORS, e.g. REVIEW_AUTHORS=alice,bob $0 install"; exit 1; }
     [ -f "$REVIEW_TOKEN_FILE" ] || { echo "missing review token file: $REVIEW_TOKEN_FILE"; exit 1; }
     mkdir -p "$(dirname "$PLIST")" "$(dirname "$LOG")"
@@ -43,7 +47,9 @@ case "${1:-}" in
     <key>REVIEW_TOKEN_FILE</key><string>$REVIEW_TOKEN_FILE</string>
     <key>REVIEW_AUTHORS</key><string>$REVIEW_AUTHORS</string>
     <key>REVIEW_DB</key><string>$REVIEW_DB</string>
-    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <key>REVIEW_IMAGE</key><string>$REVIEW_IMAGE</string>
+    <key>REVIEW_TEST_CMD</key><string>$REVIEW_TEST_CMD</string>
+    <key>PATH</key><string>$HOME/.docker/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
   </dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>

@@ -89,15 +89,20 @@ node helper/cli.js claim-next                 # claim the first available one
 
 A reserved task refuses everyone else's claim (`reserved for member-b`); a closed task refuses all claims.
 
-## Review worker (Mac mini, phase 1: dispatcher)
+## Review worker (Mac mini: dispatcher + Docker test sandbox)
 
 Watches open PRs and puts two commit statuses on every new head commit: `adabra/tests` and `adabra/review`. Make both
 required in branch protection and a failing or missing check blocks the merge; a new push is checked again.
-Phase 1 has no sandbox yet, so both checks report `error` (never a pass). See `REVIEW_WORKER_PLAN.md` in the plan folder.
+`adabra/tests` runs `npm test` on the exact commit inside a throwaway Docker container (no network, no host files, no
+secrets, not root, read-only system, 4 GB / 2 CPU / 512 processes / 15 min). `adabra/review` is still a placeholder
+that reports `error` until phase 3. See `REVIEW_WORKER_PLAN.md` in the plan folder.
 
 ```bash
 umask 077; mkdir -p ~/.adabra; read -rs T; printf %s "$T" > ~/.adabra/review-token; unset T   # paste token, Enter
-REVIEW_AUTHORS=Mominumer service/reviewer-service.sh install
+docker pull node:26-slim
+node reviewer/main.js sandbox-check        # must print "sandbox is locked down" before any PR runs
+REVIEW_AUTHORS=Mominumer REVIEW_IMAGE=$(docker image inspect node:26-slim --format '{{index .RepoDigests 0}}') \
+  service/reviewer-service.sh install
 service/reviewer-service.sh status
 node reviewer/main.js retry <pr>          # run a PR's latest commit again
 ```
