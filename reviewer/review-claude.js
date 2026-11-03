@@ -11,7 +11,7 @@ import { parseTaskId } from './task-results.js';
 // The real review, same contract as the mock: given a job, return { state, summary, findings, reviewer }. It costs money, so the
 // checks that spend nothing come first, and a pass comes only from a result judgeRun accepts.
 // These two must match the wrapper's --model and --system-prompt-file; a test holds them together.
-export const SKILL = 'review-v1';
+export const SKILL = 'review-v2';
 export const MODEL = 'claude-sonnet-5-5';
 export const PRECHECK_REVIEWER = 'adabra-precheck';
 export const DEFAULT_DAILY_CAP = 30;
@@ -114,6 +114,9 @@ export function claudeReview({
       case 'invalid':
         store.reviewWorked();
         return final(STATUS_TEXT.invalid);
+      case 'partial-read':
+        store.reviewWorked();
+        return final(STATUS_TEXT.partialRead);
       case 'transient':
         store.clearStrikes();
         break;
@@ -168,15 +171,16 @@ export function claudeReview({
         paths.add(f.filename);
         if (f.previous_filename) paths.add(f.previous_filename);
       }
-      const judged = judgeRun(run, { sha: job.sha, files: paths, jobDir: written.dir, now: now() });
+      const judged = judgeRun(run, { sha: job.sha, files: paths, jobDir: written.dir, now: now(), diff: diffText(files) });
       const { cost, turns, durationMs, modelUsage } = judged.usage;
       store.finishReviewRun(runId, {
         outcome: judged.ok ? 'valid' : judged.class,
         paid: judged.ok || judged.paid,
-        result: judged.ok ? { state: judged.state, findings: judged.findings } : null,
+        result: judged.ok ? { state: judged.state, findings: judged.findings, read: judged.read } : null,
         cost, turns, durationMs, modelUsage, now: now(),
       });
-      const measured = `estimated cost ${cost ?? 'unknown'}, ${turns ?? '?'} turn(s), ${durationMs ?? '?'} ms`;
+      const lines = judged.read ? `, read ${judged.read.read} of ${judged.read.total} diff lines` : '';
+      const measured = `estimated cost ${cost ?? 'unknown'}, ${turns ?? '?'} turn(s), ${durationMs ?? '?'} ms${lines}`;
       log(`${label} review run: ${judged.ok ? judged.state : judged.class} (${measured})`);
       if (!judged.ok) {
         log(`${label} review problem: ${judged.why}. ${localDetail(judged.raw)}`);

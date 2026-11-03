@@ -20,7 +20,7 @@ import { ReviewStore } from './store.js';
 // So it has a ceiling of its own, per named run. It prints case names, fixed words and numbers. What the model wrote goes to files of mode 600.
 export const SEEDED_CEILING = 30; // the whole set once, and room for a few errors to be tried again
 export const BAR = { defectsCaught: 8, falseBlocks: 1, errorShare: 0.1 };
-const FINAL_ERRORS = new Set(['invalid', 'run-limit']); // the same as in a real review: running it again would cost the same
+const FINAL_ERRORS = new Set(['invalid', 'run-limit', 'partial-read']); // the same as in a real review: running it again would cost the same
 const NOT_THE_CASES_FAULT = new Set(['limit', 'auth']);
 const ERRORS_TO_STOP = 3; // in a row. If the parser has the CLI's output wrong, every case would pay to find that out
 
@@ -50,7 +50,7 @@ export function caseState(runs, c, score = outcomeOf) {
   const attempts = rows.filter((r) => r.paid && !NOT_THE_CASES_FAULT.has(r.outcome)).length;
   const seen = { name: c.name, kind: c.kind, attempts, runs: rows.length, paidRuns: rows.filter((r) => r.paid).length, cost: total('cost_usd'), turns: total('num_turns'), durationMs: total('duration_ms') };
   const valid = runs.cachedReview({ pr: c.pr, sha: c.sha, skill: SKILL, model: MODEL });
-  if (valid) return { ...seen, finished: true, outcome: score(c, valid), state: valid.state, findings: valid.findings };
+  if (valid) return { ...seen, finished: true, outcome: score(c, valid), state: valid.state, findings: valid.findings, read: valid.read ?? null };
   const last = rows.at(-1);
   if (!last || NOT_THE_CASES_FAULT.has(last.outcome)) return { ...seen, finished: false, outcome: 'not-run' };
   const errorClass = last.outcome ?? 'unfinished';

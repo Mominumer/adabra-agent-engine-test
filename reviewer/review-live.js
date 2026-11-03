@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { isStopped as stopInForce } from '../shared/stop.js';
 import { hasTerminal, typed } from '../shared/terminal.js';
 import { normalize, renderComment } from './dispatcher.js';
-import { buildJobDir, removeJobDir, STREAM_MARK, walk } from './job-dir.js';
+import { buildJobDir, removeJobDir, walk } from './job-dir.js';
 import { liveFixture, liveTarball, plainTar, SKILL_NAME } from './live-fixture.js';
 import { isObject, parseStream, safeName, shapeDifferences, shapeFacts } from './output-shape.js';
 import { agreedToSpend, findingAt, looksLikeCredential, openServiceStore, runsDir, saveLocal, spendRefusal } from './paid-tools.js';
@@ -32,7 +32,6 @@ const OTHER_JOB_PR = CHECK_PR_BASE + 3;
 const LINK_JOB_PR = CHECK_PR_BASE + 4;
 const JOB_CANARY_FILE = 'job-canary.txt';
 const ALLOWED_TOOLS = new Set(['Read', 'Grep', 'Glob', 'StructuredOutput']); // the last is how --json-schema answers
-const LIVE_MAX_BYTES = 16 * 1024 * 1024; // line-by-line output repeats what the tools read, so it is allowed to be longer than one result
 const NO_CONCLUSION = new Set(['limit', 'auth']); // the model did not get to answer, so this run proves nothing
 
 const hex = (bytes = 20) => randomBytes(bytes).toString('hex');
@@ -245,7 +244,7 @@ export async function liveCheck({ sandbox, store, opt = OPT, runner, probe, root
       const jobCanary = canaryText();
       const fixture = liveFixture({ claimedSha: hex(), port: listener.port, tell, markers, paths: [homeCanary, optCanary, otherCanary, `./${JOB_CANARY_FILE}`] });
       const base = { root, pr: variant.pr, sha, diff: fixture.diff, title: fixture.title, body: fixture.body, paid: true };
-      const marks = { [STREAM_MARK]: '', [JOB_CANARY_FILE]: jobCanary };
+      const marks = { [JOB_CANARY_FILE]: jobCanary };
       let job;
       if (variant.name === 'cleaned') {
         const { tar, report } = await sandbox.cleanTree({ name: `adabra-review-live-${variant.pr}-${now()}`, tarball: liveTarball(fixture, [homeCanary, optCanary]) });
@@ -359,7 +358,7 @@ export async function liveCommand({
     const reviewUser = readPaths(opt).REVIEW_USER;
     const r = await liveCheck({
       sandbox, store, opt, now, dailyCap, dir,
-      runner: sudoRunner({ opt, ...(sudo ? { sudo } : {}), ...(deadlineMs ? { deadlineMs } : {}), maxBytes: LIVE_MAX_BYTES }),
+      runner: sudoRunner({ opt, ...(sudo ? { sudo } : {}), ...(deadlineMs ? { deadlineMs } : {}) }),
       probe: (...job) => defaultRun(sudo ?? '/usr/bin/sudo', ['-n', '-u', reviewUser, join(opt, 'bin', 'run-review'), 'check', ...job], { cwd: opt, env: { PATH: '/usr/bin:/bin' } }),
       ...(root ? { root } : {}), ...(markerDir ? { markerDir } : {}), ...(isStopped ? { isStopped } : {}),
     });

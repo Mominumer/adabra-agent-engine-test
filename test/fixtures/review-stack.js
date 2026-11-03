@@ -41,7 +41,7 @@ export function installStack(dir, { enabled = true, credential = true, canary = 
   chmodSync(join(opt, 'bin', 'claude'), 0o755);
   writeFileSync(join(opt, 'etc', 'paths.sh'), `REVIEW_USER=${userInfo().username}\nREVIEW_HOME=${home}\nDISPATCHER_HOME=${join(dir, 'none')}\nSERVICE_DIR=${service}\n`);
   for (const f of ['settings.json', 'review-schema.json']) writeFileSync(join(opt, 'etc', f), readFileSync(join(USER_DIR, f)));
-  writeFileSync(join(opt, 'skill', 'review-v1.md'), readFileSync(join(USER_DIR, 'review-v1.md')));
+  writeFileSync(join(opt, 'skill', 'review-v2.md'), readFileSync(join(USER_DIR, 'review-v2.md')));
   if (enabled) writeFileSync(join(opt, 'etc', 'model-enabled'), '');
   if (credential) writeFileSync(join(home, '.review-credential'), `${CREDENTIAL}\n`);
   if (canary) {

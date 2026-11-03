@@ -67,7 +67,7 @@ safe_path "$OWNER_HOME" && safe_path "$RU_HOME" || die "could not read the home 
 [ "$(stat -f %Lp "$OWNER_HOME")" = 700 ] || die "$OWNER_HOME must be mode 700 before the review user can be trusted near it"
 [ "$(stat -f %Lp "$RU_HOME")" = 700 ] || die "$RU_HOME must be mode 700"
 [ -x "$OPT/bin/claude" ] && [ "$(stat -f %Su "$OPT/bin/claude")" = root ] || die "$OPT/bin/claude must exist and be owned by root"
-for f in run-review settings.json review-schema.json review-v1.md; do
+for f in run-review settings.json review-schema.json review-v2.md; do
   [ -f "$SRC/$f" ] || die "missing $SRC/$f"
 done
 # Where the services' databases are, so the check probes the real ones even when this runs from another checkout.
@@ -80,7 +80,8 @@ install -d -o root -g wheel -m 755 "$OPT" "$OPT/bin" "$OPT/etc" "$OPT/skill"
 install -o root -g wheel -m 755 "$SRC/run-review" "$OPT/bin/run-review"
 install -o root -g wheel -m 644 "$SRC/settings.json" "$OPT/etc/settings.json"
 install -o root -g wheel -m 644 "$SRC/review-schema.json" "$OPT/etc/review-schema.json"
-install -o root -g wheel -m 644 "$SRC/review-v1.md" "$OPT/skill/review-v1.md"
+install -o root -g wheel -m 644 "$SRC/review-v2.md" "$OPT/skill/review-v2.md"
+rm -f "$OPT/skill/review-v1.md" # the previous version, which nothing names now
 PATHS_TMP="$(mktemp "$OPT/etc/.paths.XXXXXX")"
 cat > "$PATHS_TMP" <<EOF
 REVIEW_USER=$RU
