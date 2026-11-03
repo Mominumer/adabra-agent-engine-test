@@ -51,7 +51,7 @@ test('passing tests: success, and the exact tarball is streamed into the contain
     assert.match(r.log, /pass 3/);
     const [run] = t.runs();
     assert.equal(Buffer.from(run.stdin, 'base64').toString(), tarball.toString());
-    assert.deepEqual(run.args.slice(-5), ['sh', '-c', 'tar -xzf - --strip-components=1 -C /work && exec sh -c "$1"', 'sandbox', 'npm test']);
+    assert.deepEqual(run.args.slice(-5), ['sh', '-c', 'tar -xzf - --strip-components=1 --exclude=node_modules --exclude=.npmrc -C /work && exec sh -c "$1"', 'sandbox', 'npm test']);
   } finally {
     t.done();
   }

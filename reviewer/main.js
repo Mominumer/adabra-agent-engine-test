@@ -8,7 +8,7 @@
 //   node reviewer/main.js sandbox-check  prove the Docker sandbox is locked down (no PR needed)
 //   node reviewer/main.js review-check   prove the review user's containment (no PR, no token, no model call; needs service/review-user.sh)
 //   node reviewer/main.js review-check --live [--yes]   the same proof with 2 paid runs on a hostile fixture: see review-live.js
-//   node reviewer/main.js seeded-run [--yes] [--run-name <name>]   up to 25 paid runs on a set with known answers, and its numbers: see seeded-run.js
+//   node reviewer/main.js seeded-run [--yes] [--set v1|hard] [--run-name <name>]   up to 25 paid runs (28 with --set hard) on a set with known answers, and its numbers: see seeded-run.js
 //   node reviewer/main.js github-check   do these GitHub settings work? reads only, opens no database
 //   node reviewer/main.js override <pr> --reason "..."   operator only, at a terminal: see override.js and service/ops.sh
 //
@@ -192,6 +192,6 @@ if (cmd === 'serve') {
 } else if (cmd === 'retry' && Number.isInteger(Number(args[0]))) {
   console.log(store.retry(Number(args[0])) ? `PR #${args[0]} queued again` : `no jobs for PR #${args[0]}`);
 } else {
-  console.error('usage: main.js serve | poll-once | status | retry <pr> | sandbox-check | review-check [--live [--yes]] | seeded-run [--yes] [--run-name <name>] | github-check | override <pr> --reason "..."');
+  console.error('usage: main.js serve | poll-once | status | retry <pr> | sandbox-check | review-check [--live [--yes]] | seeded-run [--yes] [--set v1|hard] [--run-name <name>] | github-check | override <pr> --reason "..."');
   process.exit(2);
 }
