@@ -125,12 +125,22 @@ test('a result of any other shape is never a pass', () => {
 const JOB_DIR = '/opt/adabra-review/in/1-x';
 const DIFF = ['--- src/a.js', '+++ src/a.js', '@@ -1 +1,3 @@', ' x', '+y', '+z', ''].join('\n'); // 6 lines and the last newline
 const WANT = DIFF.split('\n');
-const readOf = (startLine, count, over = {}, top = {}) => ({
-  type: 'user', parent_tool_use_id: null, ...top,
-  tool_use_result: { type: 'text', file: { filePath: `${JOB_DIR}/diff.patch`, content: WANT.slice(startLine - 1, startLine - 1 + count).join('\n'), numLines: count, startLine, totalLines: WANT.length, ...over } },
-});
-const events = (lines, r = result()) => [{ type: 'system', subtype: 'init' }, ...lines, r].map((l) => JSON.stringify(l)).join('\n');
+// As the real CLI gives one Read: the numbered lines it sent the model, and its record of the file's text beside them.
+const numbered = (text, start = 1) => String(text).split('\n').map((l, i) => `${start + i}\t${l}`).join('\n');
+const sentAs = (content, extra = {}) => ({ message: { content: [{ type: 'tool_result', content, ...extra }] } });
+const readOf = (startLine, count, over = {}, top = {}) => {
+  const content = WANT.slice(startLine - 1, startLine - 1 + count).join('\n');
+  return {
+    type: 'user', parent_tool_use_id: null, ...sentAs(numbered(content, startLine)), ...top,
+    tool_use_result: { type: 'text', file: { filePath: `${JOB_DIR}/diff.patch`, content, numLines: count, startLine, totalLines: WANT.length, ...over } },
+  };
+};
+const ANSWER = { type: 'assistant', parent_tool_use_id: null, message: { content: [{ type: 'tool_use', name: 'StructuredOutput', input: {} }] } };
+const INIT = { type: 'system', subtype: 'init' };
+const asLines = (lines) => lines.map((l) => JSON.stringify(l)).join('\n');
+const events = (lines, r = result()) => asLines([INIT, ...lines, ANSWER, r]);
 const judgeRead = (lines, r, over) => judgeRun(run(events(lines, r), over), { ...CTX, jobDir: JOB_DIR, diff: DIFF });
+const judgeExactly = (lines) => judgeRun(run(asLines([INIT, ...lines, result()])), { ...CTX, jobDir: JOB_DIR, diff: DIFF });
 const blocked = () => result({ structured_output: good({ verdict: 'fail', findings: [finding({ severity: 'blocker' })] }) });
 
 test('a pass needs every line of the diff read: at once, in pieces, overlapping or out of order', () => {
@@ -177,25 +187,83 @@ test('what does not count as reading the diff', () => {
     assert.equal(judgeRead([line]).class, 'partial-read', what);
   }
   assert.equal(judgeRead([readOf(1, 7, { startLine: 2 })]).class, 'partial-read', 'lines that do not sit where the file has them');
+  assert.equal(judgeRead([readOf(1, 7, { startLine: '1' })]).class, 'partial-read', 'a start that is only text, however like a number');
+});
+
+test('a read that came back after the answer is too late: the verdict was already written', () => {
+  const whole = readOf(1, 7);
+  assert.equal(judgeExactly([whole, ANSWER]).state, 'success');
+  assert.equal(judgeExactly([ANSWER, whole]).class, 'partial-read', 'all of it recorded after the answer');
+  assert.equal(judgeExactly([readOf(1, 3), ANSWER, readOf(4, 3)]).class, 'partial-read', 'the rest recorded after it');
+  const together = { type: 'assistant', parent_tool_use_id: null, message: { content: [{ type: 'tool_use', name: 'Read', input: {} }, { type: 'tool_use', name: 'StructuredOutput', input: {} }] } };
+  assert.equal(judgeExactly([readOf(1, 3), together, readOf(4, 3)]).class, 'partial-read', 'asked for in the same message as the answer');
+  const split = { type: 'assistant', parent_tool_use_id: null, message: { content: [{ type: 'tool_use', name: 'Read', input: {} }] } };
+  assert.equal(judgeExactly([readOf(1, 3), split, ANSWER, readOf(4, 3)]).class, 'partial-read', 'and when the CLI gives each part of that message its own line');
+  assert.equal(judgeExactly([readOf(1, 3), ANSWER, readOf(4, 3), ANSWER]).state, 'success', 'an answer the schema sent back, then more reading, then the answer that counts');
+  assert.equal(judgeExactly([whole]).class, 'partial-read', 'with no answer on record, nothing shows the reading came first');
+});
+
+test('a read the model was not given in full is not read, whatever the CLI recorded beside it', () => {
+  for (const [what, sent] of Object.entries({
+    'nothing': sentAs(''),
+    'a stub': sentAs('<persisted-output>output too large</persisted-output>'),
+    'only its first line': sentAs(numbered(WANT[0])),
+    'other lines, numbered': sentAs(numbered('--- other\n+++ other\n@@ -1 +1 @@\n x\n+y\n+z')),
+    'the lines without their numbers': sentAs(WANT.join('\n')),
+    'text that is not a string': sentAs([{ type: 'text', text: numbered(WANT.join('\n')) }]),
+    'an error': sentAs(numbered(WANT.join('\n')), { is_error: true }),
+    'no message at all': { message: undefined },
+  })) {
+    assert.equal(judgeRead([readOf(1, 7, {}, sent)]).class, 'partial-read', what);
+  }
+});
+
+test('a compaction replaces what came before it with a summary, so those reads no longer count', () => {
+  const compaction = { type: 'system', subtype: 'compact_boundary', compact_metadata: { trigger: 'auto' } };
+  assert.equal(judgeRead([readOf(1, 7), compaction]).class, 'partial-read');
+  assert.equal(judgeRead([readOf(1, 4), compaction, readOf(5, 3)]).class, 'partial-read');
+  assert.equal(judgeRead([readOf(1, 4), compaction, readOf(1, 7)]).state, 'success', 'reading it again afterwards does count');
+  assert.equal(judgeExactly([readOf(1, 7), ANSWER, compaction]).class, 'partial-read', 'nor is it safe to guess about one after the answer');
+});
+
+test('an offset of 0 is the first line, though the CLI reports it as line 0', () => {
+  assert.equal(judgeRead([readOf(1, 7, { startLine: 0 })]).state, 'success');
+  assert.deepEqual(judgeRead([readOf(1, 7, { startLine: 0 })]).read, { read: 6, total: 6 });
 });
 
 test('a line the tool cut short is not read, so text cannot hide past where it stops', () => {
   const long = `+${'x'.repeat(5000)}`;
   const diff = `--- a\n+++ a\n${long}\n+end\n`;
   const cut = `--- a\n+++ a\n${long.slice(0, 2000)}\n+end\n`;
-  const record = (content) => [{ type: 'user', tool_use_result: { file: { filePath: `${JOB_DIR}/diff.patch`, content, startLine: 1, numLines: 5, totalLines: 5 } } }];
+  const record = (content, sent = content) => [{ type: 'user', ...sentAs(numbered(sent)), tool_use_result: { file: { filePath: `${JOB_DIR}/diff.patch`, content, startLine: 1, numLines: 5, totalLines: 5 } } }];
   const ctx = { ...CTX, jobDir: JOB_DIR, diff };
   assert.equal(judgeRun(run(events(record(cut))), ctx).class, 'partial-read');
+  assert.equal(judgeRun(run(events(record(diff, cut))), ctx).class, 'partial-read', 'cut only in what the model was sent');
   assert.equal(judgeRun(run(events(record(diff))), ctx).ok, true);
 });
 
 test('line endings do not make a line unread, and an empty diff has nothing to read', () => {
-  const diff = '--- a\r\n+++ a\r\n+x\r\n';
   const content = '--- a\n+++ a\n+x\n';
-  const line = { type: 'user', tool_use_result: { file: { filePath: `${JOB_DIR}/diff.patch`, content, startLine: 1, numLines: 4, totalLines: 4 } } };
-  assert.equal(judgeRun(run(events([line])), { ...CTX, jobDir: JOB_DIR, diff }).ok, true);
+  const line = { type: 'user', ...sentAs(numbered(content)), tool_use_result: { file: { filePath: `${JOB_DIR}/diff.patch`, content, startLine: 1, numLines: 4, totalLines: 4 } } };
+  assert.equal(judgeRun(run(events([line])), { ...CTX, jobDir: JOB_DIR, diff: '--- a\r\n+++ a\r\n+x\r\n' }).ok, true, 'CRLF, which the CLI hands back as LF');
+  assert.equal(judgeRun(run(events([line])), { ...CTX, jobDir: JOB_DIR, diff: '--- a\r\r\n+++ a\n+x\n' }).ok, true, 'and a line ending in more CRs than that, which hide nothing');
   assert.deepEqual(diffRead([], { diff: '', jobDir: JOB_DIR }), { read: 0, total: 0 });
   assert.equal(judgeRun(run(events([])), { ...CTX, jobDir: JOB_DIR, diff: '' }).ok, true);
+});
+
+test('only the one newline at the very end need not be reached: a blank line before it is a line', () => {
+  const diff = '--- a\n+++ a\n+x\n\n';
+  const part = '--- a\n+++ a\n+x';
+  const line = { type: 'user', ...sentAs(numbered(part)), tool_use_result: { file: { filePath: `${JOB_DIR}/diff.patch`, content: part, startLine: 1, numLines: 3, totalLines: 5 } } };
+  const r = judgeRun(run(events([line])), { ...CTX, jobDir: JOB_DIR, diff });
+  assert.equal(r.class, 'partial-read');
+  assert.equal(r.why, 'the review read 3 of 4 lines of the diff');
+});
+
+test('line-by-line output may be many times its diff, up to the limit', () => {
+  assert.equal(MAX_OUTPUT_BYTES, 16 * 1024 * 1024);
+  const padding = { type: 'assistant', message: { content: [{ type: 'text', text: 'x'.repeat(3 * 1024 * 1024) }] } };
+  assert.equal(judgeRun(run(events([padding, readOf(1, 7)])), { ...CTX, jobDir: JOB_DIR, diff: DIFF }).state, 'success', 'past the old limit of 2 MB');
 });
 
 test('with no diff to compare, as in the live check, nothing is asked about reading', () => {
@@ -214,6 +282,8 @@ test('line-by-line output: the last result counts, and the lines around it are n
   }
   assert.equal(judgeRun(run(noResult, { code: 1, stderr: words }), CTX).class, 'limit', 'what the CLI says on stderr is still read');
   assert.equal(judgeRun(run('You have hit your session limit', { code: 1 }), CTX).class, 'limit', 'as is plain text with no events at all');
+  assert.equal(judgeRun(run(`${noResult}\nYou have hit your session limit`, { code: 1 }), CTX).class, 'limit', 'and plain text after them, which is the CLI speaking and not a file');
+  assert.ok(!judgeRun(run(`${noResult}\nYou have hit your session limit`, { code: 1 }), CTX).raw.includes('Overloaded'), 'with the events left out of what is searched and logged');
   const marked = events([fromAFile], result({ is_error: true, subtype: 'error_during_execution', result: 'Overloaded', structured_output: undefined }));
   assert.equal(judgeRun(run(marked), CTX).class, 'transient', 'and the result the CLI marks as an error');
 });
@@ -397,13 +467,23 @@ test('pre-checks: a changed file GitHub will not show blocks, unless there is no
   assert.deepEqual(blockerAt(pre([unshown('tool.bin')])), ['tool.bin:null']);
   assert.deepEqual(blockerAt(pre([unshown('huge.js', { changes: 90_000 })])), ['huge.js:null']);
   assert.deepEqual(blockerAt(pre([unshown('moved.js', { status: 'renamed', changes: 7 })])), ['moved.js:null'], 'a rename with changes GitHub will not show');
-  for (const fine of [unshown('logo.PNG'), unshown('font.woff2'), unshown('gone.bin', { status: 'removed' }), unshown('moved.js', { status: 'renamed', previous_filename: 'old.js' }), unshown('__init__.py', { status: 'added', sha: 'e69de29bb2d1d6434b8b29ae775ad8c2e48c5391' })]) {
+  assert.deepEqual(blockerAt(pre([{ filename: 'src/evil.js', status: 'modified', patch: null }])), ['src/evil.js:null'], 'a patch of null is not a patch');
+  for (const fine of [unshown('gone.bin', { status: 'removed' }), unshown('moved.js', { status: 'renamed', previous_filename: 'old.js' }), unshown('__init__.py', { status: 'added', sha: 'e69de29bb2d1d6434b8b29ae775ad8c2e48c5391' })]) {
     const r = pre([fine]);
     assert.deepEqual(r.blockers, [], fine.filename);
     assert.ok(r.attention.some((a) => a.includes('not shown by GitHub')), `${fine.filename} is still listed`);
   }
-  assert.deepEqual(blockerAt(pre([unshown('logo.png')], { unshownOk: ['woff'] })), ['logo.png:null'], 'the operator\'s list replaces the default');
+});
+
+test('pre-checks: an image or font extension says nothing about what a file holds, so it blocks unless the operator says otherwise', () => {
+  for (const name of ['logo.png', 'logo.PNG', 'font.woff2', 'photo.jpg', 'anim.gif']) {
+    assert.deepEqual(blockerAt(pre([unshown(name)])), [`${name}:null`], name);
+  }
+  assert.deepEqual(blockerAt(pre([unshown('logo.png')], { unshownOk: ['woff'] })), ['logo.png:null'], 'the operator\'s list says which');
+  assert.deepEqual(pre([unshown('logo.PNG')], { unshownOk: ['png'] }).blockers, []);
   assert.deepEqual(pre([unshown('tool.bin')], { unshownOk: ['bin'] }).blockers, []);
+  const listed = pre([unshown('logo.png')], { unshownOk: ['png'] });
+  assert.ok(listed.attention.some((a) => a.includes('not shown by GitHub')), 'and it stays on the list for a person to look at');
 });
 
 test('pre-checks: the sensitive paths go on the list to read', () => {

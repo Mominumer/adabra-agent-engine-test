@@ -10,7 +10,7 @@ import { parseStream, shapeDifferences, shapeFacts } from './output-shape.js';
 import { agreedToSpend, appendLocal, findingAt, openServiceStore, runsDir, saveLocal, spendRefusal } from './paid-tools.js';
 import { OPT } from './review-check.js';
 import { claudeReview, MAX_PAID_ATTEMPTS, MODEL, SKILL, sudoRunner } from './review-claude.js';
-import { ReviewHalted, ReviewPaused } from './review-output.js';
+import { REVIEW_BASE, ReviewHalted, ReviewPaused } from './review-output.js';
 import { seededCases, SET_VERSION } from './seeded-set.js';
 import { ReviewStore } from './store.js';
 
@@ -30,7 +30,7 @@ export function seededGitHub(cases) {
   return Object.freeze({
     compareFiles: async (base, sha) => ({ files: bySha.get(sha).changed, truncated: false }),
     downloadTarball: async (sha) => bySha.get(sha).tarball,
-    getPull: async (pr) => ({ sha: byPr.get(pr).sha, state: 'open' }),
+    getPull: async (pr) => ({ sha: byPr.get(pr).sha, state: 'open', base: REVIEW_BASE }),
   });
 }
 

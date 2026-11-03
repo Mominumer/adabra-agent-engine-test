@@ -10,6 +10,8 @@ import { parseStream } from './output-shape.js';
 
 export const MAX_OUTPUT_BYTES = 16 * 1024 * 1024; // line-by-line output repeats what the tools read, so one run can be many times its diff
 export const SCHEMA = JSON.parse(readFileSync(new URL('./review-user/review-schema.json', import.meta.url), 'utf8'));
+// The one branch this reviews for. A PR against another branch shows a smaller diff than main would, and its green statuses stay on the commit if it is retargeted.
+export const REVIEW_BASE = 'main';
 
 export const STATUS_TEXT = {
   limit: 'Review paused (reviewer limit); retries automatically',
@@ -197,23 +199,37 @@ function manifestPath(file, { files, jobDir }) {
   return null;
 }
 
-const withoutCr = (line) => line.replace(/\r$/, '');
+const withoutCr = (line) => line.replace(/\r+$/, ''); // the CLI hands back CRLF as LF, and a line's final CRs hide nothing
+const NUMBERED = /^\s*\d+[\t→]/;
+const isAnswer = (l) => l.type === 'assistant' && Array.isArray(l.message?.content) && l.message.content.some((c) => c?.type === 'tool_use' && c.name === 'StructuredOutput');
+const isCompaction = (l) => l.type === 'system' && /compact/i.test(String(l.subtype));
 
-// How much of diff.patch reached the model, from the CLI's own record of each Read: { read, total }, in lines. A model cannot say this for itself: a hostile PR
-// that talks it out of reading on could talk it into saying it had finished. A line counts only if what came back equals the line, so one the tool cut short is
-// not read, and a file planted to look like the diff is not the diff. These are the CLI's events, and a file's text cannot forge one, as it arrives inside a string.
+// How much of diff.patch reached the model before it answered, from the CLI's own record of each Read: { read, total }, in lines. A model cannot say this for
+// itself: a hostile PR that talks it out of reading on could talk it into saying it had finished. These are the CLI's events, and a file's text cannot forge one, as
+// it arrives inside a string. A line counts only if:
+//   - it came back before the last answer, and since the last compaction, which replaces what came before it with a summary. A read asked for alongside the answer
+//     comes back after it, too late to have been read.
+//   - both what the CLI recorded and what it sent the model equal the line. So a line the tool cut short is not read, a stub in place of the text is not read, and a
+//     file planted to look like the diff is not the diff.
 export function diffRead(lines, { diff, jobDir }) {
   const want = String(diff).split('\n').map(withoutCr);
   if (want.at(-1) === '') want.pop(); // all the file's last newline leaves, and a read need not reach it
   const named = `/${basename(jobDir)}/diff.patch`;
   const seen = new Set();
-  for (const l of lines) {
+  const from = lines.findLastIndex(isCompaction) + 1;
+  for (const l of lines.slice(from, Math.max(from, lines.findLastIndex(isAnswer)))) {
     const file = l.type === 'user' && (l.parent_tool_use_id ?? null) === null ? l.tool_use_result?.file : null;
     if (!IS_TYPE.object(file) || typeof file.filePath !== 'string' || typeof file.content !== 'string' || !Number.isSafeInteger(file.startLine)) continue;
     if (!file.filePath.endsWith(named)) continue;
+    const sent = Array.isArray(l.message?.content) ? l.message.content.find((c) => c?.type === 'tool_result') : null;
+    if (sent?.is_error === true || typeof sent?.content !== 'string') continue;
+    const given = sent.content.split('\n');
     file.content.split('\n').forEach((line, i) => {
-      const at = file.startLine - 1 + i;
-      if (withoutCr(line) === want[at]) seen.add(at);
+      const number = given[i]?.match(NUMBERED);
+      if (!number) return;
+      const text = withoutCr(line);
+      const at = Math.max(file.startLine, 1) - 1 + i; // an offset of 0 is reported as line 0, and is the first line
+      if (text === want[at] && withoutCr(given[i].slice(number[0].length)) === text) seen.add(at);
     });
   }
   return { read: seen.size, total: want.length };
@@ -234,11 +250,11 @@ export function judgeRun(run, ctx) {
   if (run.timedOut || run.signal || [124, 137, 143].includes(code)) return problem('run-limit', 'time limit hit or killed', stderr);
   if (run.overflow || Buffer.byteLength(stdout) > MAX_OUTPUT_BYTES) return problem('invalid', 'output over the size limit', stderr);
 
-  // One JSON value a line, and a single result is the same thing with one line. Once the lines are events they hold what the tools read, which is the PR's text, so
-  // they are no place to look for what went wrong: a PR must not be able to pause the reviewer by holding the words.
+  // One JSON value a line, and a single result is the same thing with one line. Events hold what the tools read, which is the PR's text, so they are no place to look
+  // for what went wrong: a PR must not be able to pause the reviewer by holding the words. Only lines that are not events are, as the CLI prints those itself.
   const stream = parseStream(stdout);
   const parsed = stream.unparsed ? null : (stream.result ?? parseOne(stdout));
-  if (!parsed) return judgeNotAResult({ code, stdout: stream.lines.length ? '' : stdout, stderr }, now);
+  if (!parsed) return judgeNotAResult({ code, stdout: stream.notJson.join('\n'), stderr }, now);
 
   // Only the CLI's own error markers open the door to reading text: `result` on a success is the model's words.
   const markedAsError = parsed.type === 'result' && (parsed.is_error === true || (typeof parsed.subtype === 'string' && parsed.subtype !== 'success'));

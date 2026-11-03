@@ -1,6 +1,6 @@
 import { REVIEW_MARKER } from './github.js';
 import { buildResult, parseTaskId } from './task-results.js';
-import { ReviewPaused, ReviewSuperseded, STATUS_TEXT } from './review-output.js';
+import { REVIEW_BASE, ReviewPaused, ReviewSuperseded, STATUS_TEXT } from './review-output.js';
 import { fence, plain, quiet } from '../shared/sanitize.js';
 import { AUTH_HOLD_MS, upsertComment } from '../shared/github-auth.js';
 
@@ -79,6 +79,7 @@ export class Dispatcher {
     if (pr.draft) return 'draft';
     if (pr.head_repo !== this.repo) return 'from a fork';
     if (!this.authors.has(pr.author)) return `author ${pr.author} is not on the allowlist`;
+    if (pr.base !== REVIEW_BASE) return `it targets ${pr.base}, not ${REVIEW_BASE}`;
     return null;
   }
 

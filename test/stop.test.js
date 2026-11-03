@@ -1502,7 +1502,7 @@ async function fakeGitHub(t) {
   const port = await new Promise((r) => server.listen(0, '127.0.0.1', () => r(server.address().port)));
   t.after(() => new Promise((r) => (server.closeAllConnections?.(), server.close(r))));
   const pull = (number, s, over = {}) => {
-    pulls.set(number, { number, title: `PR ${number} @octocat`, state: 'open', merged: false, user: { login: 'alice' }, head: { sha: s, ref: `task/TASK-${number}` }, ...over });
+    pulls.set(number, { number, title: `PR ${number} @octocat`, state: 'open', merged: false, user: { login: 'alice' }, head: { sha: s, ref: `task/TASK-${number}` }, base: { ref: 'main' }, ...over });
   };
   return { pulls, statuses, requests, state, pull, client: new ReviewGitHub({ apiUrl: `http://127.0.0.1:${port}`, repo: 'o/r', token: 'review-token-secret', timeoutMs: 2000 }) };
 }
@@ -1687,7 +1687,11 @@ test('GitHub client: getPull gives the PR as it is now, and null when there is n
   const gh = await fakeGitHub(t);
   gh.pull(7, sha(3), { state: 'closed', merged: true });
   assert.deepEqual(await gh.client.getPull(7), {
-    number: 7, sha: sha(3), branch: 'task/TASK-7', state: 'closed', merged: true, author: 'alice', title: 'PR 7 @octocat',
+    number: 7, sha: sha(3), branch: 'task/TASK-7', base: 'main', state: 'closed', merged: true, author: 'alice', title: 'PR 7 @octocat',
   });
+  gh.pull(9, sha(4), { base: { ref: 'stack-base' } });
+  assert.equal((await gh.client.getPull(9)).base, 'stack-base', 'the base as it really is, as the review checks it just before a paid run');
+  gh.pull(10, sha(5), { base: undefined });
+  assert.equal((await gh.client.getPull(10)).base, null, 'and no guess when GitHub gives none');
   assert.equal(await gh.client.getPull(8), null);
 });

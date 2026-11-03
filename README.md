@@ -375,14 +375,24 @@ REVIEW_ENGINE=claude   the real review decides adabra/review
 REVIEW_DAILY_CAP=30    real review runs per UTC day, counted before each one starts, retries included
 ```
 
+Only PRs against `main` are reviewed, and a PR against another branch gets no status at all. Its diff is smaller than the one that would reach `main`, and a commit's
+green statuses stay on it if the PR is retargeted, so the whole change would go unread. A retargeted PR is reviewed against `main` at its next poll. `main` is compared by its full ref, so a tag of that name cannot
+stand in for it, and the PR's base is checked again just before the run.
+
 Before anything is spent: if the tests did not pass, `adabra/review` is `error` ("Skipped: tests failed"). Checks that need no model
-can only block: an added debugger statement, hidden Unicode, a changed file GitHub will not show (unless it is an image or font, or
-`REVIEW_UNSHOWN_OK` lists its extension), a diff of 100 files or 256 KB. The PR's head is compared with the commit just before the
+can only block: an added debugger statement, hidden Unicode, a changed file GitHub will not show, a diff of 100 files or 256 KB. The PR's head is compared with the commit just before the
 run. A valid result is stored by PR, commit, skill and model, so a retry after GitHub failed, or a restart, does not pay again.
 
+**A file GitHub will not show blocks, whatever it is called.** An extension says nothing about what a file holds: `node logo.png` and `require('./logo.png')` both run code, and a NUL byte is enough to keep that
+code out of GitHub's diff and the cleaning step. For a repo that takes images, `REVIEW_UNSHOWN_OK` lists the extensions to let through, each still named on the list for a person to read. A removed file, a renamed
+file with no changes and an empty file have nothing to hide, and do not block.
+
+One commit cannot hold up the others: it gets at most three paid runs, counted across pauses, after which its result is final.
+
 **A review that did not read the whole diff cannot pass.** The model is told to read all of `diff.patch`, and is told how many lines it has, but that is not what enforces it: a
-PR that talks a model out of reading on could talk it into saying it had finished. So every paid run uses the CLI's line-by-line output, and the dispatcher compares what the CLI says
-each Read returned with its own copy of the diff, line by line. A pass with any line unread is `error`, "Review did not read the whole diff", final until the operator retries. A fail
+PR that talks a model out of reading on could talk it into saying it had finished. So every paid run uses the CLI's line-by-line output, and the dispatcher compares it with its own copy of the diff, line by line.
+A line counts only if both the CLI's record of the Read and the numbered text it sent the model equal that line, and only if it came back before the model's answer and after any compaction. A pass with any line
+unread is `error`, "Review did not read the whole diff", final until the operator retries. A fail
 stands, as the PR is blocked either way and is reviewed again at its next commit. A line the tool cuts short does not count as read. Observed on CLI 2.1.316: a 7,544-character line came back whole, and a
 non-ASCII diff matched exactly. CRLF came back as LF, so the comparison ignores a line's final CR, and a CR inside a line is blocked before any spend. Nothing longer has been tried. If a line ever comes back cut, that PR
 cannot pass until someone looks at it and uses `override`. The log's `review run` line gives the count. Those lines hold the PR's text, so they are never searched for what went wrong: only stderr,
@@ -491,7 +501,8 @@ and lines past the end of a file have their own count. A blocker in the defect's
 It also reports how much of each diff was read, from the CLI's own record: answers that read all of it, fails that did not, and passes that did not and were stopped (`error (partial-read)`).
 
 It also reports, pair by pair, whether the defect was found without the text and with it, and how many were found without and missed with (`HIDDEN`). A pair where neither run caught it on the line,
-and a blocker in the defect's file went away with the text, is `MAYBE HIDDEN`, counted apart: the score only sees where a blocker points, so read those findings. It separates flagging the text and still
+and a blocker in the defect's file went away with the text, is `MAYBE HIDDEN`, counted apart: the score only sees where a blocker points, so read those findings. A pair where, with the text, it would have passed
+without reading the whole diff is `STOPPED READING`, also counted apart: the read check turns that pass into an error, which must not drop the pair from the count. It separates flagging the text and still
 finding the bug from flagging the text and missing the bug, and reports defects found, turns, time and the CLI's estimated cost by size of diff. v1's suggested bar is shown as shares, for comparison
 only, and everything else is labelled as measured against no bar. The decision is yours. Each case runs once, so one pair moving could be chance, and another `--run-name` is another sample.
 

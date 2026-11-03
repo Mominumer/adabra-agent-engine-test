@@ -338,7 +338,7 @@ test('--live: an output shape that differs is reported by field and type, and th
   assert.match(printed, /^SHAPE cleaned: result\.total_cost_usd: expected number, got string$/m);
   assert.match(printed, /^SHAPE cleaned: init\.permissionMode: expected string, got number$/m);
   assert.match(printed, /^SHAPE cleaned: 1 line\(s\) of output are not JSON objects$/m);
-  assert.match(printed, /^SHAPE cleaned: lines: system\/init 1, user 1, assistant 1, surprise\/\(odd name\) 1, result\/success 1$/m);
+  assert.match(printed, /^SHAPE cleaned: lines: system\/init 1, user 1, assistant 2, surprise\/\(odd name\) 1, result\/success 1$/m);
   assert.match(printed, /^SHAPE cleaned: result fields: .*type.*\(odd name\)/m);
   assert.ok(!printed.includes(WORDS), printed);
   assert.match(h.get('cleaned.result'), /error \(invalid\): no list of permission denials/);

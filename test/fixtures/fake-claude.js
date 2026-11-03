@@ -113,11 +113,12 @@ function streamed() {
   const reads = (control.reads ?? [[1, diff.length]]).map(([startLine, count]) => {
     const part = diff.slice(startLine - 1, startLine - 1 + count);
     return {
-      type: 'user', parent_tool_use_id: null, message: { content: [{ type: 'tool_result', content: 'the numbered lines' }] },
+      type: 'user', parent_tool_use_id: null, message: { content: [{ type: 'tool_result', content: part.map((l, i) => `${startLine + i}\t${l}`).join('\n') }] },
       tool_use_result: { type: 'text', file: { filePath: join(process.cwd(), 'diff.patch'), content: part.join('\n'), numLines: part.length, startLine, totalLines: diff.length } },
     };
   });
-  const lines = [...(control.noInit ? [] : [init]), ...reads, ...given, said, ...(control.lines ?? [])];
+  const answer = { type: 'assistant', parent_tool_use_id: null, message: { content: [{ type: 'tool_use', name: 'StructuredOutput', input: {} }] } };
+  const lines = [...(control.noInit ? [] : [init]), ...reads, ...given, said, ...(control.lines ?? []), answer];
   return `${lines.map((l) => JSON.stringify(l)).join('\n')}\n${result()}\n`;
 }
 

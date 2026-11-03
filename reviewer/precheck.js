@@ -4,8 +4,9 @@ import { plain } from '../shared/sanitize.js';
 // model's verdict cannot undo them. The list for a human to read goes in the comment and blocks nothing.
 export const LIMITS = { files: 100, diffBytes: 256 * 1024 };
 
-// Extensions a changed file may have when GitHub will not show it: things that are not code. REVIEW_UNSHOWN_OK replaces the list.
-export const UNSHOWN_OK = ['png', 'jpg', 'jpeg', 'gif', 'webp', 'ico', 'woff', 'woff2', 'ttf', 'otf', 'eot'];
+// Extensions a changed file may have when GitHub will not show it. None by default: an extension says nothing about what a file holds, and `node logo.png` and
+// `require('./logo.png')` both run code, with a NUL byte enough to keep it from GitHub's diff and the cleaning step. REVIEW_UNSHOWN_OK is the operator's word for a repo that takes images.
+export const UNSHOWN_OK = [];
 
 const EMPTY_BLOB = 'e69de29bb2d1d6434b8b29ae775ad8c2e48c5391';
 // Bidi controls that reorder what a reader sees, and tag characters a reader cannot see at all.
@@ -85,7 +86,7 @@ export function preCheck({ files, truncated = false, title = '', body = '', unsh
       blockers.push({ file: null, line: null, severity: 'blocker', message: 'A changed file\'s name holds hidden Unicode (bidi controls or tag characters).' });
     }
     if (names.some((n) => READ_YOURSELF.some((p) => p.test(n)))) attention.push(f.filename);
-    if (f.patch === undefined) {
+    if ((f.patch ?? null) === null) {
       attention.push(`${f.filename} (not shown by GitHub)`);
       if (!unshownIsFine(f, allowed)) {
         blockers.push({ file: f.filename, line: null, severity: 'blocker', message: 'GitHub will not show this changed file, so it cannot be reviewed.' });
