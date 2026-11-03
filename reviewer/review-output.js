@@ -1,12 +1,14 @@
 import { readFileSync } from 'node:fs';
+import { basename } from 'node:path';
 import { plain } from '../shared/sanitize.js';
+import { parseStream } from './output-shape.js';
 
 // Reads what the review step printed and decides what it means. All of it is untrusted: the CLI has just read a PR, and the
 // model's text is in there. So a pass comes only from a complete result that passes every check below; anything else is a
 // failure with a class, and the class decides what happens next. The text of a failure goes to the local log only. The words
 // that reach GitHub are the fixed ones in STATUS_TEXT, because a CLI's error text can name account details and the repo is public.
 
-export const MAX_OUTPUT_BYTES = 2 * 1024 * 1024;
+export const MAX_OUTPUT_BYTES = 16 * 1024 * 1024; // line-by-line output repeats what the tools read, so one run can be many times its diff
 export const SCHEMA = JSON.parse(readFileSync(new URL('./review-user/review-schema.json', import.meta.url), 'utf8'));
 
 export const STATUS_TEXT = {
@@ -19,6 +21,7 @@ export const STATUS_TEXT = {
   unreadable: 'Source archive could not be read',
   runLimit: 'Review stopped at its run limit; the operator can retry',
   invalid: 'Review gave no valid result; the operator can retry',
+  partialRead: 'Review did not read the whole diff; the operator can retry',
   transient: 'Review could not complete; the operator can retry',
 };
 
@@ -194,12 +197,35 @@ function manifestPath(file, { files, jobDir }) {
   return null;
 }
 
+const withoutCr = (line) => line.replace(/\r$/, '');
+
+// How much of diff.patch reached the model, from the CLI's own record of each Read: { read, total }, in lines. A model cannot say this for itself: a hostile PR
+// that talks it out of reading on could talk it into saying it had finished. A line counts only if what came back equals the line, so one the tool cut short is
+// not read, and a file planted to look like the diff is not the diff. These are the CLI's events, and a file's text cannot forge one, as it arrives inside a string.
+export function diffRead(lines, { diff, jobDir }) {
+  const want = String(diff).split('\n').map(withoutCr);
+  if (want.at(-1) === '') want.pop(); // all the file's last newline leaves, and a read need not reach it
+  const named = `/${basename(jobDir)}/diff.patch`;
+  const seen = new Set();
+  for (const l of lines) {
+    const file = l.type === 'user' && (l.parent_tool_use_id ?? null) === null ? l.tool_use_result?.file : null;
+    if (!IS_TYPE.object(file) || typeof file.filePath !== 'string' || typeof file.content !== 'string' || !Number.isSafeInteger(file.startLine)) continue;
+    if (!file.filePath.endsWith(named)) continue;
+    file.content.split('\n').forEach((line, i) => {
+      const at = file.startLine - 1 + i;
+      if (withoutCr(line) === want[at]) seen.add(at);
+    });
+  }
+  return { read: seen.size, total: want.length };
+}
+
 // run: what the wrapper did, { code, signal, timedOut, overflow, stdout, stderr }.
-// ctx: { sha, files: Set of every path a finding may name, jobDir, now }.
-// Returns { ok: true, state, findings, usage } only for a fully valid result, otherwise { ok: false, class, why, raw, paid, usage, resetAt }.
+// ctx: { sha, files: Set of every path a finding may name, jobDir, now, diff }. With `diff`, the text of diff.patch, a review that did not read all of it cannot pass.
+// Returns { ok: true, state, findings, usage, read } only for a fully valid result, otherwise { ok: false, class, why, raw, paid, usage, resetAt }.
 //   limit, auth         pause: nothing more is spent until it lifts
 //   transient, unknown  retried a few times; unknown also counts towards opening the pause
 //   run-limit, invalid  final: running it again would cost the same
+//   partial-read        final, as above: it passed without reading the whole diff. A fail stands, as a blocked PR is reviewed again at its next commit
 export function judgeRun(run, ctx) {
   const now = ctx.now ?? Date.now();
   const stderr = String(run.stderr ?? '');
@@ -208,8 +234,11 @@ export function judgeRun(run, ctx) {
   if (run.timedOut || run.signal || [124, 137, 143].includes(code)) return problem('run-limit', 'time limit hit or killed', stderr);
   if (run.overflow || Buffer.byteLength(stdout) > MAX_OUTPUT_BYTES) return problem('invalid', 'output over the size limit', stderr);
 
-  const parsed = parseOne(stdout);
-  if (!parsed) return judgeNotAResult({ code, stdout, stderr }, now);
+  // One JSON value a line, and a single result is the same thing with one line. Once the lines are events they hold what the tools read, which is the PR's text, so
+  // they are no place to look for what went wrong: a PR must not be able to pause the reviewer by holding the words.
+  const stream = parseStream(stdout);
+  const parsed = stream.unparsed ? null : (stream.result ?? parseOne(stdout));
+  if (!parsed) return judgeNotAResult({ code, stdout: stream.lines.length ? '' : stdout, stderr }, now);
 
   // Only the CLI's own error markers open the door to reading text: `result` on a success is the model's words.
   const markedAsError = parsed.type === 'result' && (parsed.is_error === true || (typeof parsed.subtype === 'string' && parsed.subtype !== 'success'));
@@ -241,7 +270,9 @@ export function judgeRun(run, ctx) {
   }
   const blockers = findings.filter((f) => f.severity === 'blocker').length;
   if ((out.verdict === 'pass') !== (blockers === 0)) return problem('invalid', 'the verdict and the findings disagree', '', parsed);
-  return { ok: true, state: out.verdict === 'pass' ? 'success' : 'failure', findings, usage: usageOf(parsed) };
+  const read = ctx.diff === undefined ? null : diffRead(stream.lines, ctx);
+  if (read && read.read < read.total && out.verdict === 'pass') return problem('partial-read', `the review read ${read.read} of ${read.total} lines of the diff`, '', parsed);
+  return { ok: true, state: out.verdict === 'pass' ? 'success' : 'failure', findings, usage: usageOf(parsed), read };
 }
 
 // The status text for a result: counted by the dispatcher, so it never holds the model's words.

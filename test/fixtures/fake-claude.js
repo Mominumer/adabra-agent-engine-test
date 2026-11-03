@@ -17,7 +17,8 @@
 //   noInit     leave the init line out
 //   text       what the model says
 //   lines      more lines (objects) to print before the result
-//   loaded     a file in the job, whose text the model repeats with no tool having given it: as if the CLI had loaded it as configuration
+//   reads      which parts of diff.patch the review reads, as [[first line, how many]], where the real one's Read would report them. Default: all of it
+//   loaded    a file in the job, whose text the model repeats with no tool having given it: as if the CLI had loaded it as configuration
 //   readAsData the same, but after a tool result gave it to the model
 //   copyPlanted answers with the review.json the PR planted in its tree
 //   obey       plays a review whose limits have all failed. It does what the job's pr.json asks, as far as this user's permissions go: reads
@@ -25,6 +26,7 @@
 // FAKE_CLAUDE_RECORD is a file that gets one JSON line per run: its arguments, directory and environment.
 import { execSync, spawnSync } from 'node:child_process';
 import { appendFileSync, existsSync, readdirSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
 
 const args = process.argv.slice(2);
 if (args.includes('--version')) {
@@ -107,7 +109,15 @@ function streamed() {
   const inJob = (name) => (name && existsSync(name) ? readFileSync(name, 'utf8') : '');
   const said = { type: 'assistant', message: { content: [{ type: 'text', text: `${control.text ?? 'free text from the model'} ${inJob(control.loaded)}${inJob(control.readAsData)}` }] } };
   const given = control.readAsData ? [{ type: 'user', message: { content: [{ type: 'tool_result', content: inJob(control.readAsData) }] } }] : [];
-  const lines = [...(control.noInit ? [] : [init]), ...given, said, ...(control.lines ?? [])];
+  const diff = inJob('diff.patch').split('\n');
+  const reads = (control.reads ?? [[1, diff.length]]).map(([startLine, count]) => {
+    const part = diff.slice(startLine - 1, startLine - 1 + count);
+    return {
+      type: 'user', parent_tool_use_id: null, message: { content: [{ type: 'tool_result', content: 'the numbered lines' }] },
+      tool_use_result: { type: 'text', file: { filePath: join(process.cwd(), 'diff.patch'), content: part.join('\n'), numLines: part.length, startLine, totalLines: diff.length } },
+    };
+  });
+  const lines = [...(control.noInit ? [] : [init]), ...reads, ...given, said, ...(control.lines ?? [])];
   return `${lines.map((l) => JSON.stringify(l)).join('\n')}\n${result()}\n`;
 }
 

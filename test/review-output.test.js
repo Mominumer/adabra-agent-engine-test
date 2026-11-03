@@ -4,7 +4,7 @@ import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { classifyText, judgeRun, localDetail, parseReset, reviewSummary, schemaErrors, SCHEMA, STATUS_TEXT } from '../reviewer/review-output.js';
+import { classifyText, diffRead, judgeRun, localDetail, MAX_OUTPUT_BYTES, parseReset, reviewSummary, schemaErrors, SCHEMA, STATUS_TEXT } from '../reviewer/review-output.js';
 import { addedLines, diffText, LIMITS, preCheck } from '../reviewer/precheck.js';
 import { nextUtcMidnight, ReviewStore } from '../reviewer/store.js';
 import { normalize, renderComment } from '../reviewer/dispatcher.js';
@@ -117,7 +117,105 @@ test('a result of any other shape is never a pass', () => {
   for (const over of [{ code: 1 }, { code: 124 }, { code: 137 }, { code: null, signal: 'SIGKILL' }, { timedOut: true, code: null }, { overflow: true, code: null }]) {
     assert.equal(judge(result(), over).ok, false, JSON.stringify(over));
   }
-  assert.equal(judge(`${JSON.stringify(result())}${' '.repeat(2 * 1024 * 1024)}`).ok, false, 'over the size limit, however valid');
+  assert.equal(judge(`${JSON.stringify(result())}${' '.repeat(MAX_OUTPUT_BYTES)}`).ok, false, 'over the size limit, however valid');
+  assert.equal(judge(`${JSON.stringify(result())}\nand some more words`).ok, false, 'a result with anything else after it is not one');
+});
+
+// --- reading the whole diff -----------------------------------------------
+const JOB_DIR = '/opt/adabra-review/in/1-x';
+const DIFF = ['--- src/a.js', '+++ src/a.js', '@@ -1 +1,3 @@', ' x', '+y', '+z', ''].join('\n'); // 6 lines and the last newline
+const WANT = DIFF.split('\n');
+const readOf = (startLine, count, over = {}, top = {}) => ({
+  type: 'user', parent_tool_use_id: null, ...top,
+  tool_use_result: { type: 'text', file: { filePath: `${JOB_DIR}/diff.patch`, content: WANT.slice(startLine - 1, startLine - 1 + count).join('\n'), numLines: count, startLine, totalLines: WANT.length, ...over } },
+});
+const events = (lines, r = result()) => [{ type: 'system', subtype: 'init' }, ...lines, r].map((l) => JSON.stringify(l)).join('\n');
+const judgeRead = (lines, r, over) => judgeRun(run(events(lines, r), over), { ...CTX, jobDir: JOB_DIR, diff: DIFF });
+const blocked = () => result({ structured_output: good({ verdict: 'fail', findings: [finding({ severity: 'blocker' })] }) });
+
+test('a pass needs every line of the diff read: at once, in pieces, overlapping or out of order', () => {
+  assert.deepEqual(judgeRead([readOf(1, 7)]).read, { read: 6, total: 6 });
+  assert.equal(judgeRead([readOf(1, 7)]).state, 'success');
+  assert.equal(judgeRead([readOf(1, 6)]).state, 'success', 'the empty end after the last newline need not be reached');
+  assert.equal(judgeRead([readOf(4, 3), readOf(1, 3)]).state, 'success');
+  assert.equal(judgeRead([readOf(1, 4), readOf(3, 4)]).state, 'success');
+});
+
+test('a pass with any line unread is partial-read, final, and says only how many', () => {
+  for (const lines of [[], [readOf(1, 5)], [readOf(2, 6)], [readOf(1, 2), readOf(4, 3)]]) {
+    const r = judgeRead(lines);
+    assert.equal(r.ok, false, JSON.stringify(lines).slice(0, 80));
+    assert.equal(r.class, 'partial-read');
+    assert.equal(r.paid, true, 'it was paid for');
+    assert.match(r.why, /^the review read \d of 6 lines of the diff$/);
+    assert.equal(r.raw, '');
+  }
+  assert.equal(judgeRead([readOf(1, 5)]).usage.cost, null);
+});
+
+test('a fail stands without the whole diff, as the PR is blocked and is reviewed again at its next commit, and the count comes with it', () => {
+  const r = judgeRead([readOf(1, 2)], blocked());
+  assert.equal(r.state, 'failure');
+  assert.deepEqual(r.read, { read: 2, total: 6 });
+});
+
+test('what does not count as reading the diff', () => {
+  const asJson = JSON.stringify(readOf(1, 7));
+  const notRead = {
+    'a file planted under tree/ with the same name': readOf(1, 7, { filePath: `${JOB_DIR}/tree/diff.patch` }),
+    'a file of that name in another job': readOf(1, 7, { filePath: '/opt/adabra-review/in/2-y/diff.patch' }),
+    'the right name with other text': readOf(1, 7, { content: 'made up\nlines\n' }),
+    'a read by something other than the review': readOf(1, 7, {}, { parent_tool_use_id: 'toolu_1' }),
+    'the record from a message of another kind': readOf(1, 7, {}, { type: 'assistant' }),
+    'a start that is no line': readOf(1, 7, { startLine: 'one' }),
+    'no text': readOf(1, 7, { content: null }),
+    'no path': readOf(1, 7, { filePath: null }),
+    'the words of a read, as the model\'s text': { type: 'assistant', message: { content: [{ type: 'text', text: asJson }] } },
+    'the words of a read, as what a file said': { type: 'user', message: { content: [{ type: 'tool_result', content: asJson }] } },
+  };
+  for (const [what, line] of Object.entries(notRead)) {
+    assert.equal(judgeRead([line]).class, 'partial-read', what);
+  }
+  assert.equal(judgeRead([readOf(1, 7, { startLine: 2 })]).class, 'partial-read', 'lines that do not sit where the file has them');
+});
+
+test('a line the tool cut short is not read, so text cannot hide past where it stops', () => {
+  const long = `+${'x'.repeat(5000)}`;
+  const diff = `--- a\n+++ a\n${long}\n+end\n`;
+  const cut = `--- a\n+++ a\n${long.slice(0, 2000)}\n+end\n`;
+  const record = (content) => [{ type: 'user', tool_use_result: { file: { filePath: `${JOB_DIR}/diff.patch`, content, startLine: 1, numLines: 5, totalLines: 5 } } }];
+  const ctx = { ...CTX, jobDir: JOB_DIR, diff };
+  assert.equal(judgeRun(run(events(record(cut))), ctx).class, 'partial-read');
+  assert.equal(judgeRun(run(events(record(diff))), ctx).ok, true);
+});
+
+test('line endings do not make a line unread, and an empty diff has nothing to read', () => {
+  const diff = '--- a\r\n+++ a\r\n+x\r\n';
+  const content = '--- a\n+++ a\n+x\n';
+  const line = { type: 'user', tool_use_result: { file: { filePath: `${JOB_DIR}/diff.patch`, content, startLine: 1, numLines: 4, totalLines: 4 } } };
+  assert.equal(judgeRun(run(events([line])), { ...CTX, jobDir: JOB_DIR, diff }).ok, true);
+  assert.deepEqual(diffRead([], { diff: '', jobDir: JOB_DIR }), { read: 0, total: 0 });
+  assert.equal(judgeRun(run(events([])), { ...CTX, jobDir: JOB_DIR, diff: '' }).ok, true);
+});
+
+test('with no diff to compare, as in the live check, nothing is asked about reading', () => {
+  assert.equal(judge(result()).read, null);
+  assert.equal(judge(result()).ok, true);
+});
+
+test('line-by-line output: the last result counts, and the lines around it are no source for what went wrong', () => {
+  const words = "You've hit your session limit. Not logged in. Overloaded.";
+  const fromAFile = { type: 'user', message: { content: [{ type: 'tool_result', content: words }] }, tool_use_result: { type: 'text', file: { filePath: `${JOB_DIR}/tree/x`, content: words, startLine: 1 } } };
+  const noResult = [{ type: 'system', subtype: 'init' }, fromAFile].map((l) => JSON.stringify(l)).join('\n');
+  for (const over of [{ code: 1 }, { code: 0 }]) {
+    const r = judgeRun(run(noResult, over), { ...CTX, jobDir: JOB_DIR, diff: DIFF });
+    assert.equal(r.class, 'unknown', 'a PR holding the words cannot pause the reviewer');
+    assert.ok(!r.raw.includes('session limit'), 'and they stay out of the log');
+  }
+  assert.equal(judgeRun(run(noResult, { code: 1, stderr: words }), CTX).class, 'limit', 'what the CLI says on stderr is still read');
+  assert.equal(judgeRun(run('You have hit your session limit', { code: 1 }), CTX).class, 'limit', 'as is plain text with no events at all');
+  const marked = events([fromAFile], result({ is_error: true, subtype: 'error_during_execution', result: 'Overloaded', structured_output: undefined }));
+  assert.equal(judgeRun(run(marked), CTX).class, 'transient', 'and the result the CLI marks as an error');
 });
 
 test('each failure has its class, and the classes decide what happens next', () => {

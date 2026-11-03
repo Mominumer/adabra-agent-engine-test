@@ -15,7 +15,7 @@ import { HOSTILE_KEPT, hostileTarball } from './tar.js';
 export const OPT = '/opt/adabra-review';
 const REVIEW_SHA = 'c'.repeat(40);
 const ROOT_OWNED = [
-  '', 'bin', 'bin/claude', 'bin/run-review', 'etc', 'etc/paths.sh', 'etc/settings.json', 'etc/review-schema.json', 'skill', 'skill/review-v1.md',
+  '', 'bin', 'bin/claude', 'bin/run-review', 'etc', 'etc/paths.sh', 'etc/settings.json', 'etc/review-schema.json', 'skill', 'skill/review-v2.md',
 ];
 // What a shell started with a clean environment sets for itself, and what the wrapper sets. Anything else came from outside.
 const ALLOWED_ENV = new Set(['HOME', 'PATH', 'PWD', 'OLDPWD', 'SHLVL', '_', '__CF_USER_TEXT_ENCODING']);

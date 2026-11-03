@@ -11,7 +11,7 @@ const BUILDING_RE = /^\.building-[1-9][0-9]{0,8}-[0-9a-f]{40}-[0-9]{10,16}$/;
 const DIR_MODE = 0o750;
 const FILE_MODE = 0o640;
 export const PAID_MARK = 'paid-run';
-export const STREAM_MARK = 'stream-output'; // the wrapper then asks the CLI for line-by-line output: only the live check writes this
+export const STREAM_MARK = 'stream-output'; // the wrapper then asks the CLI for line-by-line output, which is the only record of what the review read
 
 export function jobId(pr, sha, now = Date.now()) {
   const id = `${pr}-${sha}-${now}`;
@@ -62,8 +62,8 @@ export function unpackCleanTar(tar, dest) {
 
 // Builds the job under a name the wrapper refuses, then renames it, so the review user can never see a half-written job.
 // Returns { id, dir, files }. `report` is the cleaning step's report of what it dropped.
-// `paid` writes the mark the wrapper requires before it starts the model. Off by default, so a job built for any other reason cannot
-// spend. It sits beside tree/, which is the only place PR content goes, so a PR cannot plant it.
+// `paid` writes the mark the wrapper requires before it starts the model, and the one for line-by-line output. Off by default, so a job built for any other
+// reason cannot spend. They sit beside tree/, which is the only place PR content goes, so a PR cannot plant them.
 // `besideTree` is more files beside tree/, for the live check. No path that takes a PR's content sets it.
 export function buildJobDir({ root = JOB_ROOT, pr, sha, tar, report, diff = '', title = '', body = '', task = null, now = Date.now(), paid = false, besideTree = {} }) {
   const id = jobId(pr, sha, now);
@@ -81,7 +81,10 @@ export function buildJobDir({ root = JOB_ROOT, pr, sha, tar, report, diff = '', 
       dropped_total: report?.dropped_total ?? 0,
       dropped: report?.dropped ?? [],
     }, null, 2));
-    if (paid) writeNew(join(building, PAID_MARK), '');
+    if (paid) {
+      writeNew(join(building, PAID_MARK), '');
+      writeNew(join(building, STREAM_MARK), '');
+    }
     const made = new Set();
     for (const [path, data] of Object.entries(besideTree)) writeBelow(building, path, data, made);
     renameSync(building, dir);
