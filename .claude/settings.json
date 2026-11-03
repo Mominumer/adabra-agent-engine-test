@@ -20,6 +20,9 @@
       "Bash(git push -f:*)",
       "Bash(*main.js override*)",
       "Bash(*ops.sh override*)",
+      "Bash(*main.js run-once*)",
+      "Bash(*night/main.js serve*)",
+      "Bash(*night-service.sh install*)",
       "Bash(*main.js resume*)",
       "Bash(*ops.sh resume*)",
       "Bash(*main.js switch-stop*)",
@@ -66,7 +69,10 @@
       "Bash(node ops/main.js status)",
       "Bash(node ops/main.js check)",
       "Bash(node ops/main.js health)",
-      "Bash(node ops/main.js health --last)"
+      "Bash(node ops/main.js health --last)",
+      "Bash(node night/main.js status)",
+      "Bash(node night/main.js report)",
+      "Bash(service/night-service.sh status)"
     ]
   }
 }

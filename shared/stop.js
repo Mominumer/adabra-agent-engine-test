@@ -18,9 +18,9 @@ import { operatorText, plain } from './sanitize.js';
 // Reading fails safe. A well-formed "not stopped" means running, and so does "no file yet" outside the machine folder, which is a
 // machine with no stop feature set up. Anything else counts as stopped, and that includes no file inside the machine folder.
 //
-// One gap: if the folder is ever removed, the default falls back to the per-user file, where no file reads as running. So a later
-// unattended service must name /opt/adabra-control/stop.json in its own settings, pass that to readStop({ path }), where a missing
-// file counts as stopped with or without the folder, and refuse to start if it is missing. Nothing does that yet.
+// One gap: if the folder is ever removed, the default falls back to the per-user file, where no file reads as running. So an unattended
+// service must name /opt/adabra-control/stop.json in its own settings, pass that to readStop({ path }), where a missing file counts as
+// stopped with or without the folder, and refuse to start if it is missing. The overnight runner does: see night/settings.js.
 //
 // A long-running job (the overnight runner, say) checks before it starts anything and between steps, either way:
 //   service/ops.sh check                    exit 0 = go; any other exit = do not start. Prints one line of JSON.

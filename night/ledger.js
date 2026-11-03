@@ -95,6 +95,11 @@ export class Ledger {
     return this.#db.prepare(`SELECT * FROM attempts WHERE state = 'started' ORDER BY started_at`).all();
   }
 
+  // Every attempt started at or after this time, whatever became of it.
+  startedSince(ms) {
+    return this.#db.prepare('SELECT * FROM attempts WHERE started_at >= ? ORDER BY started_at').all(ms);
+  }
+
   close() {
     this.#db.close();
   }
