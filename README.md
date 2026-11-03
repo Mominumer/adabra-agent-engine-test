@@ -383,8 +383,9 @@ run. A valid result is stored by PR, commit, skill and model, so a retry after G
 **A review that did not read the whole diff cannot pass.** The model is told to read all of `diff.patch`, and is told how many lines it has, but that is not what enforces it: a
 PR that talks a model out of reading on could talk it into saying it had finished. So every paid run uses the CLI's line-by-line output, and the dispatcher compares what the CLI says
 each Read returned with its own copy of the diff, line by line. A pass with any line unread is `error`, "Review did not read the whole diff", final until the operator retries. A fail
-stands, as the PR is blocked either way and is reviewed again at its next commit. A line the tool cuts short does not count as read, so a PR with a very long line cannot pass until
-someone looks at it and uses `override`, whatever the model says. The log's `review run` line gives the count. Those lines hold the PR's text, so they are never searched for what went wrong: only stderr,
+stands, as the PR is blocked either way and is reviewed again at its next commit. A line the tool cuts short does not count as read. Observed on CLI 2.1.316: a 7,544-character line came back whole, and a
+non-ASCII diff matched exactly. CRLF came back as LF, so the comparison ignores a line's final CR, and a CR inside a line is blocked before any spend. Nothing longer has been tried. If a line ever comes back cut, that PR
+cannot pass until someone looks at it and uses `override`. The log's `review run` line gives the count. Those lines hold the PR's text, so they are never searched for what went wrong: only stderr,
 plain output with no events and a result the CLI itself marks as an error are.
 
 What comes back is untrusted, so the dispatcher checks it itself: the result's type, subtype and `is_error` together, its own check
