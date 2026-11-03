@@ -1,0 +1,12 @@
+{
+  "disableAllHooks": true,
+  "allowManagedHooksOnly": true,
+  "allowManagedPermissionRulesOnly": true,
+  "disableClaudeAiConnectors": true,
+  "permissions": {
+    "allow": ["Bash", "Read", "Edit", "Write", "Grep", "Glob"],
+    "disableBypassPermissionsMode": "disable",
+    "blockReadsOutsideWorkingDirectories": true,
+    "blockWritesOutsideWorkingDirectories": true
+  }
+}
