@@ -48,7 +48,7 @@ export class ReviewGitHub {
           number: p.number,
           sha: p.head.sha,
           branch: p.head.ref,
-          base: p.base?.ref ?? 'main',
+          base: p.base?.ref ?? null,
           head_repo: p.head.repo?.full_name ?? null, // null when the fork was deleted
           author: p.user?.login ?? null,
           title: p.title,

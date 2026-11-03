@@ -23,7 +23,7 @@ function fakeGitHub() {
       if (failing) return json(503, { message: 'down' });
       if (req.headers.authorization !== 'Bearer review-token') return json(401, {});
       let m;
-      if (req.method === 'GET' && req.url.startsWith('/repos/o/r/pulls?')) return json(200, pulls);
+      if (req.method === 'GET' && req.url.startsWith('/repos/o/r/pulls?')) return json(200, pulls.map((p) => ({ base: { ref: 'main' }, ...p })));
       if ((m = req.url.match(/^\/repos\/o\/r\/statuses\/([0-9a-f]+)$/)) && req.method === 'POST') {
         statuses.push({ sha: m[1], ...JSON.parse(raw) });
         return json(201, {});

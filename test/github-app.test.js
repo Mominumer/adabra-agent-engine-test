@@ -120,10 +120,10 @@ function fakeGitHub(clock) {
 
       let m;
       if (req.method === 'GET' && req.url.startsWith('/repos/o/r/issues?')) return json(200, s.issues);
-      if (req.method === 'GET' && req.url.startsWith('/repos/o/r/pulls?')) return json(200, s.pulls);
+      if (req.method === 'GET' && req.url.startsWith('/repos/o/r/pulls?')) return json(200, s.pulls.map((p) => ({ base: { ref: 'main' }, ...p })));
       if ((m = req.url.match(/^\/repos\/o\/r\/pulls\/(\d+)$/)) && req.method === 'GET') {
         const p = s.pulls.find((x) => x.number === +m[1]);
-        return p ? json(200, { state: 'open', merged: false, ...p }) : json(404, { message: 'Not Found' });
+        return p ? json(200, { state: 'open', merged: false, base: { ref: 'main' }, ...p }) : json(404, { message: 'Not Found' });
       }
       if ((m = req.url.match(/^\/repos\/o\/r\/statuses\/([0-9a-f]+)$/)) && req.method === 'POST') {
         s.statuses.push({ sha: m[1], ...JSON.parse(raw) });

@@ -686,13 +686,15 @@ test('the base is named as a branch, so a tag called main cannot stand in for it
   const server = createServer((req, res) => {
     urls.push(req.url);
     res.setHeader('content-type', 'application/json');
-    res.end(JSON.stringify({ files: [] }));
+    res.end(JSON.stringify(req.url.includes('/pulls') ? [{ number: 1, head: { sha: shaOf(1), ref: 'b' }, title: 'x' }] : { files: [] }));
   });
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   t.after(() => new Promise((resolve) => server.close(resolve)));
   const github = new ReviewGitHub({ apiUrl: `http://127.0.0.1:${server.address().port}`, repo: 'o/r', token: 'x', timeoutMs: 2000 });
   await github.compareFiles('main', shaOf(1));
   assert.deepEqual(urls, [`/repos/o/r/compare/refs/heads/main...${shaOf(1)}?per_page=100`]);
+  const [listed] = await github.openPulls();
+  assert.equal(listed.base, null, 'a PR that names no base is not taken to mean main, so it is not reviewed as if it did');
 });
 
 test('one commit that always fails ends after three paid runs, even through pauses, so it cannot hold up every other PR', async (t) => {
