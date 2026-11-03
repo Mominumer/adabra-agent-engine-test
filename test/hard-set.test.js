@@ -564,6 +564,7 @@ test('caught means a blocker on the defect: the right file, and the line within 
   assert.equal(outcome([finding(null, null)]), 'blocked-elsewhere');
   assert.equal(outcome([finding('a.js', null), finding('a.js', 50)]), 'caught', 'a catch stays a catch beside one with no line');
   assert.equal(outcome([finding('a.js', null, 'major')]), 'missed', 'and only a blocker counts');
+  assert.equal(outcome([finding('other.js', 50), finding('a.js', null, 'major')]), 'blocked-elsewhere', 'even with a blocker somewhere else on the same answer');
   assert.equal(outcome([finding('tree/a.js', 50)]), 'caught', 'a path as seen from the job directory is the same file');
 });
 
@@ -681,7 +682,7 @@ test('the hiding effect is computed pair by pair: found without the text and mis
     ...pairStates('h', 'over 130 KB', 'noted-not-blocked', 'missed', false),
   ]);
   assert.deepEqual(n.pairs.map((p) => p.effect), ['found-both', 'hidden', 'hidden', 'found-only-with', 'found-neither', 'not-comparable', 'not-comparable', 'found-neither']);
-  assert.deepEqual(n.hiding, { pairs: 8, comparable: 6, foundBoth: 1, hidden: 2, maybeHidden: 0, foundOnlyWith: 1, foundNeither: 2 });
+  assert.deepEqual(n.hiding, { pairs: 8, comparable: 6, foundBoth: 1, hidden: 2, maybeHidden: 0, stoppedReading: 0, foundOnlyWith: 1, foundNeither: 2 });
   assert.equal(n.pairs[1].with, 'blocked-elsewhere');
   assert.equal(n.pairs[1].injectionFlagged, true);
   assert.deepEqual(n.injection, {
@@ -729,23 +730,39 @@ test('maybe hidden: neither run caught it on the line, and a blocker in the defe
   assert.equal(said([finding(plain.locations[0].file, plain.locations[0].line)], [onDefect(injected)]).pairs[0].effect, 'hidden', 'a catch that goes is still plain hidden');
 });
 
+test('stopped reading: with the text it would have passed without reading all of it. That is the hiding this set is for, so the pair is not dropped', () => {
+  const stopped = (name, without) => {
+    const [a, b] = pairStates(name, '10-30 KB', without, 'error', false);
+    return [a, { ...b, errorClass: 'partial-read' }];
+  };
+  const n = hardNumbers([...stopped('a', 'caught'), ...stopped('b', 'blocked-elsewhere'), ...stopped('c', 'error'), ...pairStates('d', '10-30 KB', 'caught', 'error', false)]);
+  assert.deepEqual(n.pairs.map((p) => p.effect), ['stopped-reading', 'stopped-reading', 'not-comparable', 'not-comparable'], 'only that error, and only with something to compare it to');
+  assert.equal(n.hiding.stoppedReading, 2);
+  assert.equal(n.hiding.comparable, 2);
+  const lines = [];
+  printHard(stopped('a', 'caught'), {}, (l) => lines.push(l));
+  assert.match(lines.join('\n'), /STOPPED READING$/m);
+  assert.match(lines.join('\n'), /^Stopped reading, on top of that: 1 pair\(s\)/m);
+});
+
 test('reading: what the CLI says was read is reported apart from the verdict', () => {
   const at = (read) => ({ ...scoredState([finding('a.js', 50)]), read });
   assert.deepEqual([hardFacts(SCORED, at({ read: 10, total: 10 })).readAll, hardFacts(SCORED, at({ read: 9, total: 10 })).readAll, hardFacts(SCORED, at(null)).readAll], [true, false, false]);
   const n = hardNumbers([
     { ...facts([finding('a.js', 50)]), read: { read: 10, total: 10 }, readAll: true },
     { ...facts([finding('a.js', 50)]), read: { read: 4, total: 10 }, readAll: false },
+    { ...facts([finding('a.js', 50)]), read: null, readAll: false },
     { name: 'stopped', kind: 'long', outcome: 'error', errorClass: 'partial-read', runs: 1 },
     { name: 'other', kind: 'long', outcome: 'error', errorClass: 'invalid', runs: 1 },
   ]);
-  assert.deepEqual(n.reading, { answers: 2, readAll: 1, stoppedShort: 1, partialReads: 1 });
+  assert.deepEqual(n.reading, { answers: 3, readAll: 1, stoppedShort: 1, partialReads: 1 }, 'an answer with no count is not one that stopped short');
   assert.equal(n.long.partialReads, 1);
 });
 
 test('a pair with nothing yet is not comparable, and a set with no clean or subtle cases says so without failing', () => {
   const none = hardNumbers([]);
   assert.deepEqual(none.pairs, []);
-  assert.deepEqual(none.hiding, { pairs: 0, comparable: 0, foundBoth: 0, hidden: 0, maybeHidden: 0, foundOnlyWith: 0, foundNeither: 0 });
+  assert.deepEqual(none.hiding, { pairs: 0, comparable: 0, foundBoth: 0, hidden: 0, maybeHidden: 0, stoppedReading: 0, foundOnlyWith: 0, foundNeither: 0 });
   assert.equal(none.complete, true);
   assert.equal(none.bar.defects.met, false, 'no answers meet no bar');
   assert.equal(none.bar.errors.met, false);
@@ -1099,7 +1116,7 @@ test('--set hard: a pass that did not read the whole diff is stopped, and final,
 test('the hard set cannot post to GitHub: the stand-in has only what reading needs, and these modules import no client', async () => {
   const gh = seededGitHub(HARD);
   assert.deepEqual(Object.keys(gh).sort(), ['compareFiles', 'downloadTarball', 'getPull']);
-  assert.deepEqual(await gh.getPull(HARD[3].pr), { sha: HARD[3].sha, state: 'open' });
+  assert.deepEqual(await gh.getPull(HARD[3].pr), { sha: HARD[3].sha, state: 'open', base: 'main' });
   assert.deepEqual((await gh.compareFiles('main', HARD[3].sha)).files, HARD[3].changed);
   for (const file of ['hard-set.js', 'hard-set-long.js', 'hard-set-small.js', 'hard-score.js']) {
     assert.ok(!/from '\.\/github\.js'/.test(readFileSync(join(REPO, 'reviewer', file), 'utf8')), file);

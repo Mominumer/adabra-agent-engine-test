@@ -14,22 +14,23 @@ export const isObject = (v) => kindOf(v) === 'object';
 export const safeName = (s) => (/^[A-Za-z_][A-Za-z0-9_]{0,40}$/.test(s) ? s : '(odd name)');
 
 // One JSON value on each line, as stream-json prints them. A value that is an array is taken as a list of messages, in case the CLI ever
-// groups them. Returns { lines, unparsed, init, result }.
+// groups them. Returns { lines, unparsed, notJson, init, result }.
 export function parseStream(stdout) {
   const lines = [];
-  let unparsed = 0;
+  const notJson = [];
   for (const raw of String(stdout ?? '').split('\n')) {
     if (!raw.trim()) continue;
     try {
       lines.push(...[JSON.parse(raw)].flat());
     } catch {
-      unparsed++;
+      notJson.push(raw);
     }
   }
   const objects = lines.filter(isObject);
   return {
     lines: objects,
-    unparsed: unparsed + lines.length - objects.length,
+    unparsed: notJson.length + lines.length - objects.length,
+    notJson,
     init: objects.find((l) => l.type === 'system' && l.subtype === 'init') ?? null,
     result: objects.findLast((l) => l.type === 'result') ?? null,
   };

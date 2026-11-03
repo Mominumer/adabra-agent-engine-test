@@ -424,7 +424,7 @@ test('seeded-run cannot post to GitHub: the stand-in has only what reading needs
   const gh = seededGitHub(CASES);
   assert.deepEqual(Object.keys(gh).sort(), ['compareFiles', 'downloadTarball', 'getPull']);
   assert.ok(Object.isFrozen(gh));
-  assert.deepEqual(await gh.getPull(CASES[3].pr), { sha: CASES[3].sha, state: 'open' });
+  assert.deepEqual(await gh.getPull(CASES[3].pr), { sha: CASES[3].sha, state: 'open', base: 'main' });
   assert.equal(await gh.downloadTarball(CASES[3].sha), CASES[3].tarball);
   assert.deepEqual((await gh.compareFiles('main', CASES[3].sha)).files, CASES[3].changed);
   for (const file of ['seeded-run.js', 'review-live.js', 'paid-tools.js', 'seeded-set.js', 'live-fixture.js']) {
@@ -482,7 +482,7 @@ function shadowSetup(t) {
     const pr = nextPr++;
     const sha = pr.toString(16).padStart(40, 'a');
     store.enqueue(pr, sha, { branch: `feature/${pr}`, base: 'main', author: 'alice', title: 'T', body: '' }, Date.now());
-    heads.set(pr, { sha, state: 'open' });
+    heads.set(pr, { sha, state: 'open', base: 'main' });
     writeFileSync(stack.control, JSON.stringify(typeof output === 'function' ? output(sha) : output));
     return { pr, sha, r: await d.runOnce() };
   };

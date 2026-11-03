@@ -48,7 +48,7 @@ export class ReviewGitHub {
           number: p.number,
           sha: p.head.sha,
           branch: p.head.ref,
-          base: p.base?.ref ?? 'main',
+          base: p.base?.ref ?? null,
           head_repo: p.head.repo?.full_name ?? null, // null when the fork was deleted
           author: p.user?.login ?? null,
           title: p.title,
@@ -74,6 +74,7 @@ export class ReviewGitHub {
       number: p.number,
       sha: p.head.sha,
       branch: p.head.ref,
+      base: p.base?.ref ?? null,
       state: p.state,
       merged: Boolean(p.merged),
       author: p.user?.login ?? null,
@@ -115,9 +116,10 @@ export class ReviewGitHub {
     return Buffer.concat(chunks);
   }
 
-  // Files changed by exactly `sha` relative to where it branched from `base` (what the PR shows, pinned to this commit).
+  // Files changed by exactly `sha` relative to where it branched from `base` (what the PR shows, pinned to this commit). `base` is a branch, named in full so that a
+  // tag of the same name, which a PR's author can push, cannot stand in for it and shrink the diff.
   async compareFiles(base, sha) {
-    const r = await this.#req('GET', `/repos/${this.repo}/compare/${encodeURIComponent(base)}...${sha}?per_page=100`);
+    const r = await this.#req('GET', `/repos/${this.repo}/compare/refs/heads/${encodeURIComponent(base)}...${sha}?per_page=100`);
     return { files: r.files ?? [], truncated: (r.files ?? []).length >= 300 };
   }
 

@@ -4,7 +4,7 @@ import { buildJobDir, JOB_ROOT, removeJobDir, sweepJobDirs } from './job-dir.js'
 import { diffText, preCheck, UNSHOWN_OK } from './precheck.js';
 import { OPT, readPaths } from './review-check.js';
 import { mockReview } from './review-mock.js';
-import { judgeRun, localDetail, MAX_OUTPUT_BYTES, ReviewHalted, ReviewPaused, reviewSummary, ReviewSuperseded, STATUS_TEXT } from './review-output.js';
+import { judgeRun, localDetail, MAX_OUTPUT_BYTES, REVIEW_BASE, ReviewHalted, ReviewPaused, reviewSummary, ReviewSuperseded, STATUS_TEXT } from './review-output.js';
 import { nextUtcMidnight } from './store.js';
 import { parseTaskId } from './task-results.js';
 
@@ -97,6 +97,9 @@ export function claudeReview({
     });
   };
 
+  // What this commit has really cost. A limit or a lost credential was not its doing.
+  const paidOn = (job) => store.reviewRuns(job.pr, job.sha).filter((r) => r.paid && !['limit', 'auth'].includes(r.outcome)).length;
+
   // What the failure means for this job and for the reviews after it.
   const afterFailure = (job, judged) => {
     const final = (summary) => ({ state: 'error', summary, findings: [], reviewer });
@@ -120,11 +123,14 @@ export function claudeReview({
       case 'transient':
         store.clearStrikes();
         break;
-      default:
-        // A change in a message's wording lands here. It must not be able to burn a day's runs one job at a time.
-        if (store.addStrike() >= STRIKES_TO_PAUSE) throw new ReviewPaused('limit', store.pauseForLimit(now(), null));
+      default: {
+        // A change in a message's wording lands here. It must not be able to burn a day's runs one job at a time. But a pause gives the attempt back, so attempts alone
+        // would never end a commit that always fails, and as the oldest job it would run first after every pause, ahead of every other PR.
+        const strikes = store.addStrike();
+        if (strikes >= STRIKES_TO_PAUSE && paidOn(job) < MAX_PAID_ATTEMPTS) throw new ReviewPaused('limit', store.pauseForLimit(now(), null));
+      }
     }
-    if (job.attempts + 1 >= MAX_PAID_ATTEMPTS) return final(STATUS_TEXT.transient);
+    if (job.attempts + 1 >= MAX_PAID_ATTEMPTS || paidOn(job) >= MAX_PAID_ATTEMPTS) return final(STATUS_TEXT.transient);
     throw new Error(`review step failed (${judged.class}); it will be retried`);
   };
 
@@ -159,7 +165,7 @@ export function claudeReview({
     try {
       // The last moment before spending. Fetching and cleaning take time, and a push may have landed meanwhile.
       const head = await github.getPull(job.pr);
-      if (!head || head.state !== 'open' || head.sha !== job.sha) throw new ReviewSuperseded();
+      if (!head || head.state !== 'open' || head.sha !== job.sha || head.base !== REVIEW_BASE) throw new ReviewSuperseded();
       if (halted()) throw new ReviewHalted();
       // Counted before it starts, so a crash during the run still counts it.
       const runId = store.beginReviewRun({ ...key, now: now(), cap: dailyCap });

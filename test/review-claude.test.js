@@ -2,6 +2,7 @@ import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
 import { ChildProcess, spawnSync } from 'node:child_process';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { createServer } from 'node:http';
 import { tmpdir, userInfo } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -158,7 +159,7 @@ function setup(t, { env = { REVIEW_ENGINE: 'claude', REVIEW_DAILY_CAP: '100000' 
     dir, stack, store, gh, clock, logs, d, testCalls, stop,
     queue(meta = {}, pr = nextPr++, sha = shaOf(pr)) {
       store.enqueue(pr, sha, { branch: `feature/${pr}`, base: 'main', author: 'alice', title: 'Title', body: '', ...meta }, clock.t);
-      gh.heads.set(pr, { sha, state: 'open' });
+      gh.heads.set(pr, { sha, state: 'open', base: 'main' });
       return { pr, sha };
     },
     control: (c) => writeFileSync(stack.control, JSON.stringify(c)),
@@ -639,6 +640,114 @@ test('hitting a run limit or giving invalid output is final: no automatic retry,
   }
 });
 
+test('what is compared is the whole diff.patch as the job holds it, with every changed file in it', async (t) => {
+  const h = setup(t);
+  h.gh.files = [changed('src/one.js'), changed('src/two.js')];
+  const firstOnly = await h.once({ reads: [[1, 5]] });
+  assert.equal(firstOnly.r.review, 'error', 'read the first file and never the second');
+  assert.equal(h.review(firstOnly.sha).at(-1).description, STATUS_TEXT.partialRead);
+  assert.equal((await h.once()).r.review, 'success');
+});
+
+test('only PRs against main are reviewed: a PR against another branch shows a smaller diff, and its green stays on the commit if it is retargeted', async (t) => {
+  const h = setup(t);
+  const sha = shaOf(9);
+  const pr = { number: 9, sha, branch: 'top', base: 'stack-base', head_repo: 'o/r', author: 'alice', title: 'small tidy', body: '', draft: false };
+  h.gh.openPulls = async () => [pr];
+  const asked = [];
+  const compare = h.gh.compareFiles;
+  h.gh.compareFiles = async (base, s) => {
+    asked.push(base);
+    return compare(base, s);
+  };
+  assert.equal(await h.d.poll(), 0, 'not queued');
+  assert.equal(h.store.getJob(9, sha), null, 'no job');
+  assert.deepEqual(h.gh.statuses, [], 'and nothing on the commit, so it has nothing to carry over');
+  assert.ok(h.logs.some((l) => l.includes('PR #9 skipped') && l.includes('stack-base')));
+
+  pr.base = 'main';
+  h.gh.heads.set(9, { sha, state: 'open', base: 'main' });
+  assert.equal(await h.d.poll(), 1, 'once it targets main it is reviewed like any other');
+  assert.equal((await h.d.runOnce()).review, 'success');
+  assert.deepEqual(asked, ['main']);
+});
+
+test('retargeted between being queued and the paid run: nothing is spent', async (t) => {
+  const h = setup(t);
+  const q = h.queue();
+  h.gh.heads.set(q.pr, { sha: q.sha, state: 'open', base: 'stack-base' });
+  await h.d.runOnce();
+  assert.equal(h.calls().length, 0);
+  assert.equal(h.review(q.sha).at(-1).description, STATUS_TEXT.superseded);
+});
+
+test('the base is named as a branch, so a tag called main cannot stand in for it', async (t) => {
+  const urls = [];
+  const server = createServer((req, res) => {
+    urls.push(req.url);
+    res.setHeader('content-type', 'application/json');
+    res.end(JSON.stringify(req.url.includes('/pulls') ? [{ number: 1, head: { sha: shaOf(1), ref: 'b' }, title: 'x' }] : { files: [] }));
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+  const github = new ReviewGitHub({ apiUrl: `http://127.0.0.1:${server.address().port}`, repo: 'o/r', token: 'x', timeoutMs: 2000 });
+  await github.compareFiles('main', shaOf(1));
+  assert.deepEqual(urls, [`/repos/o/r/compare/refs/heads/main...${shaOf(1)}?per_page=100`]);
+  const [listed] = await github.openPulls();
+  assert.equal(listed.base, null, 'a PR that names no base is not taken to mean main, so it is not reviewed as if it did');
+});
+
+test('one commit that always fails ends after three paid runs, even through pauses, so it cannot hold up every other PR', async (t) => {
+  const odd = { result: { is_error: true, result: 'a message nobody has ever seen' } };
+  const h = setup(t);
+  h.control(odd);
+  const bad = h.queue();
+  const other = h.queue();
+  h.store.addStrike();
+  h.store.addStrike(); // earlier failures, so the first run here opens a pause
+  const first = await h.d.runOnce();
+  assert.equal(first.paused, 'limit');
+  assert.equal(h.store.getJob(bad.pr, bad.sha).attempts, 0, 'a pause gives the attempt back');
+  for (let i = 0; i < 5 && h.store.getJob(bad.pr, bad.sha).state !== 'done'; i++) {
+    h.clock.t += 100 * HOUR;
+    await h.d.runOnce();
+  }
+  assert.equal(h.store.getJob(bad.pr, bad.sha).state, 'done');
+  assert.equal(h.calls().length, 3, 'three paid runs and no more');
+  assert.equal(h.review(bad.sha).at(-1).description, STATUS_TEXT.transient);
+
+  h.control({});
+  h.clock.t += 100 * HOUR;
+  assert.equal((await h.d.runOnce()).review, 'success', 'and the next PR gets its turn');
+  assert.equal(h.store.getJob(other.pr, other.sha).state, 'done');
+});
+
+test('an account limit is not the commit\'s doing: it does not use up its three runs', async (t) => {
+  const h = setup(t);
+  const q = h.queue();
+  h.control({ result: { is_error: true, result: "You've hit your session limit" } });
+  for (let i = 0; i < 3; i++) {
+    assert.equal((await h.d.runOnce()).paused, 'limit');
+    h.clock.t += 100 * HOUR;
+  }
+  assert.equal(h.store.reviewRuns(q.pr, q.sha).length, 3);
+  h.control({ result: { is_error: true, result: 'a message nobody has ever seen' } });
+  const next = await h.d.runOnce();
+  assert.equal(next.retry, true, 'its first failure of its own is not its last');
+  assert.equal(h.store.getJob(q.pr, q.sha).state, 'queued');
+});
+
+test('a partial read counts as a review that worked: the model answered, so strikes start again', async (t) => {
+  const h = setup(t);
+  const odd = { result: { is_error: true, result: 'a message nobody has ever seen' } };
+  h.store.addStrike();
+  h.store.addStrike();
+  await h.once({ reads: [[1, 2]] });
+  const next = await h.once(odd);
+  assert.equal(next.r.paused, undefined, 'one more failure does not open a pause');
+  assert.equal(next.r.retry, true);
+});
+
 test('a review that did not read the whole diff cannot pass, and the rest of the path treats that as final', async (t) => {
   const h = setup(t);
   const whole = await h.once();
@@ -844,7 +953,7 @@ test('the zero-width and sensitive-path list goes in the comment, and blocks not
 test('the head is checked just before spending: a moved or closed PR costs nothing, and an unknown head costs nothing either', async (t) => {
   const h = setup(t);
   const moved = h.queue();
-  h.gh.heads.set(moved.pr, { sha: 'f'.repeat(40), state: 'open' });
+  h.gh.heads.set(moved.pr, { sha: 'f'.repeat(40), state: 'open', base: 'main' });
   const r = await h.d.runOnce();
   assert.equal(r.superseded, true);
   assert.equal(h.calls().length, 0);
