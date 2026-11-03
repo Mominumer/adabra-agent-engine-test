@@ -69,7 +69,7 @@ export function pullBody({ task, runId, textSha256, baseCommit, totals, flagged 
     '',
     '**Written by a model, unattended. Treat all of it as untrusted.** Nobody watched this run, and it may have read something written to mislead it.',
     '',
-    'Green checks do not make this safe. An automated review can pass after reading only part of a large change, and a change can edit its own tests. Read the whole diff before you approve it.',
+    'Green checks do not make this safe. An automated review can pass after reading only part of a large change, and a change can edit its own tests. Read the whole diff, including any file GitHub collapses, before you approve it.',
     '',
     `- Run: \`${runId}\``,
     `- Approved issue text, SHA-256: \`${textSha256}\``,
@@ -108,7 +108,7 @@ export function gitEnvironment({ dir, gitUrl, token = null, path = process.env.P
   return env;
 }
 
-const HARDENED = ['-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', '-c', 'core.attributesFile=/dev/null', '-c', 'core.excludesFile=/dev/null', '-c', 'gc.auto=0', '-c', 'commit.gpgsign=false'];
+const HARDENED = ['-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', '-c', 'core.attributesFile=/dev/null', '-c', 'core.excludesFile=/dev/null', '-c', 'gc.auto=0', '-c', 'commit.gpgsign=false', '-c', 'http.lowSpeedLimit=1', '-c', 'http.lowSpeedTime=60'];
 
 export function gitRunner({ gitCommand, env }) {
   return (args, { input = null, timeoutMs = GIT_MS, extraEnv = {} } = {}) => runCommand(gitCommand, [...HARDENED, ...args], { env: { ...env, ...extraEnv }, input, timeoutMs });

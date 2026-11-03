@@ -66,7 +66,7 @@ function openRunner({ env, settings, ...options }) {
 
 // `run-once <TASK-N>`: one run of that task, for a person at the machine. It needs a terminal and a typed confirmation, and ignores the night
 // window and nothing else. Agents must not run it: this and the deny rules are speed bumps, like override's, not a boundary.
-export async function runOnceCommand({ args, env = process.env, say = console.log, terminal = hasTerminal(), confirm = typed, machineStopFile, ...options }) {
+export async function runOnceCommand({ args, env = process.env, say = console.log, terminal = hasTerminal(), confirm = typed, machineStopFile, signal = null, ...options }) {
   if (!terminal) {
     say('run-once needs an interactive terminal: the operator runs it at the machine. Agents must not. Nothing started.');
     return 2;
@@ -117,7 +117,18 @@ export async function runOnceCommand({ args, env = process.env, say = console.lo
       say('Not confirmed. Nothing started.');
       return 1;
     }
-    const result = await runner.attempt(number, { once: true });
+    // From here a signal must not leave a session running with nothing watching it. The tunnel's own limit is the only other end it has.
+    const end = () => void runner.abort();
+    signal?.addEventListener('abort', end, { once: true });
+    process.once('SIGTERM', end);
+    process.once('SIGINT', end);
+    let result;
+    try {
+      result = await runner.attempt(number, { once: true });
+    } finally {
+      process.removeListener('SIGTERM', end);
+      process.removeListener('SIGINT', end);
+    }
     const { text, path } = runner.writeReport();
     say(text);
     say(`Saved to ${path}`);

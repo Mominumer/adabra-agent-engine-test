@@ -26,9 +26,12 @@ const MAX_SEGMENT = 100;
 
 export const RULES = Object.freeze([
   'no_changes', 'too_large', 'too_many_files', 'not_utf8', 'binary', 'unparsed', 'path_unsafe', 'path_collision', 'protected_path',
-  'symlink', 'submodule', 'mode_change', 'mode_unknown', 'rename_or_copy', 'credential', 'git_disagrees', 'does_not_apply',
+  'symlink', 'submodule', 'mode_change', 'mode_unknown', 'rename_or_copy', 'credential', 'hidden_character', 'git_disagrees', 'does_not_apply',
 ]);
-export const PROTECTED_WORDS = Object.freeze(['.git*', '.github/', '.claude/', 'CODEOWNERS', 'CLAUDE.md', 'CLAUDE.local.md', 'AGENTS.md', '.mcp.json', '.task/']);
+export const PROTECTED_WORDS = Object.freeze([
+  '.git*', '.github/', '.claude/', 'CODEOWNERS', 'CLAUDE.md', 'CLAUDE.local.md', 'AGENTS.md', '.mcp.json', '.task/',
+  'node_modules/', '.npmrc', '.yarnrc', '.pnpmfile.cjs', '.envrc', '.husky/', '.vscode/', '.devcontainer/',
+]);
 
 const refused = (rule, file = null, word = null) => Object.freeze({ ok: false, rule, file, word });
 
@@ -38,6 +41,9 @@ const fold = (s) => s.replace(/\p{C}/gu, '').normalize('NFKC').toLowerCase().nor
 const EXACT = new Map([
   ['.github', '.github/'], ['.claude', '.claude/'], ['codeowners', 'CODEOWNERS'], ['claude.md', 'CLAUDE.md'], ['claude.local.md', 'CLAUDE.local.md'],
   ['agents.md', 'AGENTS.md'], ['.mcp.json', '.mcp.json'], ['.task', '.task/'],
+  // These run code on a checkout, or on `npm test`: node_modules/.bin comes first on PATH, and .npmrc can name the shell for every script.
+  ['node_modules', 'node_modules/'], ['.npmrc', '.npmrc'], ['.yarnrc', '.yarnrc'], ['.yarnrc.yml', '.yarnrc'], ['.pnpmfile.cjs', '.pnpmfile.cjs'], ['.envrc', '.envrc'],
+  ['.husky', '.husky/'], ['.vscode', '.vscode/'], ['.devcontainer', '.devcontainer/'],
 ]);
 
 // The word for the protected name in this path, at any depth, or null. `git~1` is how .git can be spelt on a disk with short names.
@@ -64,6 +70,12 @@ const CREDENTIAL_SHAPES = [
   /\bnpm_[A-Za-z0-9]{30,}/,
 ];
 export const credentialShaped = (text) => scrub(text) !== text || CREDENTIAL_SHAPES.some((re) => re.test(text));
+
+// What a reader cannot see, or sees as something else. A carriage return or U+2028 inside a line ends that line for `node` and not for git,
+// so `// tidy later<CR>run()` is one comment in the diff and code to whatever executes it. An escape sequence can rewrite a terminal. Bidi
+// controls reorder text, and zero-width and tag characters hide it. A tab is fine, and so is the CR that ends a line in a CRLF file.
+const HIDDEN_CHARACTER = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u;
+const hidesSomething = (line) => HIDDEN_CHARACTER.test(line.replace(/\r$/, '').replaceAll('\t', ''));
 
 // A narrow alphabet on purpose. It holds nothing git would quote, so there is one way to spell each path. It has no space, so `a/x b/x`
 // splits one way. And it holds nothing a file system folds or ignores, so a name cannot reach a protected file by another spelling.
@@ -255,6 +267,7 @@ export function validateDiff(input) {
     if (parsed.rule) return refused(parsed.rule, number, parsed.word ?? null);
     if (collides(parsed.file.path, fileKeys, dirKeys)) return refused('path_collision', number);
     if (credentialShaped(parsed.text.join('\n'))) return refused('credential', number);
+    if (parsed.text.some(hidesSomething)) return refused('hidden_character', number);
     files.push(Object.freeze(parsed.file));
     ({ at } = parsed);
   }

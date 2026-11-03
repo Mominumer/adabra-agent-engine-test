@@ -115,6 +115,9 @@ export function runCommand(file, args, { env = process.env, timeoutMs = 60_000, 
     const timer = setTimeout(() => {
       timedOut = true;
       child.kill('SIGKILL');
+      // A process it started (git's helper for https, say) can hold these open after it has gone, and then 'close' never comes.
+      child.stdout.destroy();
+      child.stderr.destroy();
     }, timeoutMs);
     child.stdout.on('data', (d) => out.push(d));
     child.stderr.on('data', (d) => err.push(d));

@@ -22,6 +22,7 @@ export const OUTCOMES = Object.freeze({
   session_reported_failure: 'No PR: the session reported that it did not finish',
   github_unreachable: 'Not published: GitHub could not be reached in time',
   pushed_no_pr: 'Branch pushed, but the PR could not be opened',
+  aborted: 'No PR: the runner was told to stop during this run',
   crashed: 'The runner crashed during this run',
   interrupted: 'Interrupted: the machine restarted during this run',
   internal_error: 'No PR: the runner hit an error of its own',
@@ -29,6 +30,7 @@ export const OUTCOMES = Object.freeze({
 
 export const COULD_NOT_START = Object.freeze({
   stopped: 'the emergency stop was in force',
+  aborted: 'the runner was told to stop',
   docker_down: 'Docker did not answer',
   image_wrong: 'the image is not the one in NIGHT_IMAGE_ID',
   review_running: 'a review container was running',

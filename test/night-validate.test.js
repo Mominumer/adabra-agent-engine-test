@@ -221,6 +221,14 @@ const PROTECTED = {
   'AGENTS.md': ['AGENTS.md', 'agents.md', 'sub/Agents.Md'],
   '.mcp.json': ['.mcp.json', '.MCP.JSON', 'sub/.mcp.json'],
   '.task/': ['.task/TASK.md'],
+  'node_modules/': ['node_modules/.bin/node', 'src/node_modules/x.js', 'NODE_MODULES/x'],
+  '.npmrc': ['.npmrc', 'sub/.NPMRC'],
+  '.yarnrc': ['.yarnrc', '.yarnrc.yml'],
+  '.pnpmfile.cjs': ['.pnpmfile.cjs'],
+  '.envrc': ['.envrc', 'sub/.envrc'],
+  '.husky/': ['.husky/pre-commit'],
+  '.vscode/': ['.vscode/tasks.json', '.VSCode/settings.json'],
+  '.devcontainer/': ['.devcontainer/devcontainer.json'],
 };
 
 test('protected names are refused at any depth, in any case', async (t) => {
@@ -257,6 +265,31 @@ test('Unicode spellings of protected names fold to them, as clean-worker.cjs doe
       assert.equal(validateDiff(newFile(`"${octal}"`)).ok, false, 'printed quoted, as git does by default');
     });
   }
+});
+
+test('an added line holding what a reader cannot see is refused, naming only the file\'s place', async (t) => {
+  const hidden = {
+    'a CR inside the line': '// tidy later\rrun();',
+    'U+2028': '// tidy later\u2028run();',
+    'U+2029': '// tidy later\u2029run();',
+    'next line, U+0085': '// tidy later\u0085run();',
+    'an escape sequence': 'fine\u001b[2K',
+    'a bidi control': 'a\u202Eb',
+    'a zero-width space': 'a\u200Bb',
+    'a byte order mark': '\uFEFFa',
+    'a tag character': 'a\u{E0041}b',
+    'a form feed': 'a\fb',
+    'a CR at the end, and another before it': 'a\r\r',
+  };
+  for (const [name, line] of Object.entries(hidden)) {
+    await t.test(name, () => {
+      const r = validateDiff(`${newFile('fine.txt')}${newFile('x.js', [line])}`);
+      assert.deepEqual({ ...r }, { ok: false, rule: 'hidden_character', file: 2, word: null });
+    });
+  }
+  await t.test('a tab, a CRLF line and ordinary text all pass', () => {
+    for (const line of ['\tindented', 'windows line\r', 'caf\u00E9 \u4F60\u597D \u{1F600}', 'a\tb\r']) assert.equal(validateDiff(newFile('x.js', [line])).ok, true, JSON.stringify(line));
+  });
 });
 
 test('credential shapes: refused in added lines and in paths, and left alone in lines that were already there', async (t) => {
