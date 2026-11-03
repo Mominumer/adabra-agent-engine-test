@@ -673,6 +673,19 @@ test('resume needs the word typed, warns if the coordinator is down, and repairs
   assert.equal(readStop({ path }).unreadable, undefined);
 });
 
+test('resume records when the word was typed, not when the prompt appeared', async (t) => {
+  const path = stopFile(t);
+  recordStop({ reason: 'x', path });
+  let typedAt = 0;
+  const confirm = async () => {
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    typedAt = Date.now();
+    return true;
+  };
+  assert.equal(await resumeCommand({ path, terminal: true, say: () => {}, coordinatorUp: async () => true, confirm }), 0);
+  assert.ok(Date.parse(readStop({ path }).last_stop.resumed_at) >= typedAt);
+});
+
 test('stop says plainly when it could not take effect, and when the state already counts as stopped', (t) => {
   const dir = tempDir(t);
   const said = [];
