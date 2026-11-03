@@ -192,7 +192,9 @@ export class Sandbox {
       const name = `adabra-review-${job.pr}-${job.sha.slice(0, 12)}-${Date.now()}`;
       const r = await this.exec({
         name,
-        script: 'tar -xzf - --strip-components=1 -C /work && exec sh -c "$1"',
+        // These two are never unpacked. npm puts node_modules/.bin first on PATH and obeys a project's .npmrc, so a PR holding a fake
+        // `node` or a `script-shell` setting would make a failing test suite exit 0.
+        script: 'tar -xzf - --strip-components=1 --exclude=node_modules --exclude=.npmrc -C /work && exec sh -c "$1"',
         args: [this.o.cmd],
         input: tarball,
       });
